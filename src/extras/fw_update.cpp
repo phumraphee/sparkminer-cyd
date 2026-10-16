@@ -156,7 +156,7 @@ static void checkNow() {
     mbedtls_sha256_starts_ret(&ctx, 0);
 
     WiFiClient *stream = http.getStreamPtr();
-    uint8_t buf[1024];
+    static uint8_t buf[1024];
     uint32_t got = 0, lastPct = 0, lastData = millis();
     while (got < size && millis() - lastData < 20000) {
         size_t avail = stream->available();
@@ -197,7 +197,17 @@ static void checkNow() {
     ESP.restart();
 }
 
+static volatile bool s_running = false;
+
+// TLS + JSON + ECDSA verification need far more stack than the extras task has
+static void updateTask(void *param) {
+    checkNow();             // Reboots on success
+    s_running = false;
+    vTaskDelete(NULL);
+}
+
 void fw_update_poll(bool autoUpdate) {
+    if (s_running) return;
     uint32_t now = millis();
     bool due = autoUpdate && (s_checkedOnce ? now - s_lastCheck >= CHECK_EVERY_MS : now >= FIRST_CHECK_MS);
     if (!s_requested && !due) return;
@@ -205,7 +215,11 @@ void fw_update_poll(bool autoUpdate) {
     s_checkedOnce = true;
     s_lastCheck = now;
     setState("Checking...");
-    checkNow();
+    s_running = true;
+    if (xTaskCreatePinnedToCore(updateTask, "FwUpdate", 16384, NULL, 1, NULL, 0) != pdPASS) {
+        s_running = false;
+        setState("Not enough memory to check");
+    }
 }
 
 #else  // No repo configured at build time
