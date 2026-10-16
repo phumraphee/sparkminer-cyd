@@ -123,6 +123,7 @@ static void updateDisplayData(display_data_t *data) {
         // Use strncpy for fixed char arrays (no heap allocation)
         strncpy(data->networkHashrate, lstats->networkHashrate, sizeof(data->networkHashrate) - 1);
         data->networkHashrate[sizeof(data->networkHashrate) - 1] = '\0';
+        data->networkDifficultyRaw = lstats->difficultyRaw;
         strncpy(data->networkDifficulty, lstats->networkDifficulty, sizeof(data->networkDifficulty) - 1);
         data->networkDifficulty[sizeof(data->networkDifficulty) - 1] = '\0';
     }
