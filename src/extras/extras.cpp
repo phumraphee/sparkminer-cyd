@@ -1,0 +1,387 @@
+/*
+ * SparkMiner - Extras Implementation
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <esp_system.h>
+#include <board_config.h>
+#include "extras.h"
+#include "fw_update.h"
+#include "../config/nvs_config.h"
+#include "../display/display.h"
+#include "../stats/monitor.h"
+#include "../stratum/stratum.h"
+#include "../mining/miner.h"
+
+#define EXTRAS_NS               "sparkx"
+#define WIFI_RESTART_MS         (5UL * 60 * 1000)   // Reboot after 5 min without WiFi (boot opens setup hotspot)
+#define OUTAGE_NOTIFY_MS        (10UL * 60 * 1000)  // Outages shorter than this are not reported
+#define ROAM_CHECK_MS           (5UL * 60 * 1000)
+#define ROAM_RSSI_WEAK          -67                 // Only look for a better AP below this signal
+#define ROAM_RSSI_GAIN          8                   // ...and only move for at least this much improvement
+#define WAKE_MS                 60000               // Full brightness after a tap at night
+
+// CYD discrete RGB LED is wired active-low
+#if defined(ESP32_2432S028)
+    #define HAVE_RGB_LED 1
+    #define LED_ON  LOW
+    #define LED_OFF HIGH
+#endif
+
+static extras_config_t s_cfg;
+static volatile bool s_dimmed = false;
+static volatile uint32_t s_wakeUntil = 0;
+static volatile bool s_blockAck = false;
+
+// ============================================================
+// Settings
+// ============================================================
+
+static void loadDefaults(extras_config_t *c) {
+    memset(c, 0, sizeof(*c));
+    c->notifyDaily = true;
+    c->nightEnabled = false;
+    c->nightStart = 22;
+    c->nightEnd = 7;
+    c->nightBright = 5;
+    c->ledEnabled = true;
+    c->autoUpdate = true;
+}
+
+void extras_init() {
+    loadDefaults(&s_cfg);
+    Preferences p;
+    if (p.begin(EXTRAS_NS, true)) {
+        p.getString("pin", s_cfg.pin, sizeof(s_cfg.pin));
+        p.getString("ntfy", s_cfg.ntfyTopic, sizeof(s_cfg.ntfyTopic));
+        s_cfg.notifyDaily  = p.getBool("daily", s_cfg.notifyDaily);
+        s_cfg.nightEnabled = p.getBool("night", s_cfg.nightEnabled);
+        s_cfg.nightStart   = p.getUChar("n_start", s_cfg.nightStart);
+        s_cfg.nightEnd     = p.getUChar("n_end", s_cfg.nightEnd);
+        s_cfg.nightBright  = p.getUChar("n_bright", s_cfg.nightBright);
+        s_cfg.ledEnabled   = p.getBool("led", s_cfg.ledEnabled);
+        s_cfg.autoUpdate   = p.getBool("auto_up", s_cfg.autoUpdate);
+        p.end();
+    }
+
+    #ifdef HAVE_RGB_LED
+        pinMode(LED_R_PIN, OUTPUT);
+        pinMode(LED_G_PIN, OUTPUT);
+        pinMode(LED_B_PIN, OUTPUT);
+        digitalWrite(LED_R_PIN, LED_OFF);
+        digitalWrite(LED_G_PIN, LED_OFF);
+        digitalWrite(LED_B_PIN, LED_OFF);
+    #endif
+}
+
+extras_config_t* extras_get() {
+    return &s_cfg;
+}
+
+bool extras_save() {
+    Preferences p;
+    if (!p.begin(EXTRAS_NS, false)) return false;
+    p.putString("pin", s_cfg.pin);
+    p.putString("ntfy", s_cfg.ntfyTopic);
+    p.putBool("daily", s_cfg.notifyDaily);
+    p.putBool("night", s_cfg.nightEnabled);
+    p.putUChar("n_start", s_cfg.nightStart);
+    p.putUChar("n_end", s_cfg.nightEnd);
+    p.putUChar("n_bright", s_cfg.nightBright);
+    p.putBool("led", s_cfg.ledEnabled);
+    p.putBool("auto_up", s_cfg.autoUpdate);
+    p.end();
+    return true;
+}
+
+void extras_request_portal() {
+    Preferences p;
+    if (p.begin(EXTRAS_NS, false)) {
+        p.putBool("portal", true);
+        p.end();
+    }
+    Serial.println("[EXTRAS] Rebooting into WiFi setup hotspot");
+    delay(200);
+    ESP.restart();
+}
+
+bool extras_take_portal_flag() {
+    Preferences p;
+    if (!p.begin(EXTRAS_NS, false)) return false;
+    bool flag = p.getBool("portal", false);
+    if (flag) p.remove("portal");
+    p.end();
+    return flag;
+}
+
+bool extras_is_dimmed() {
+    return s_dimmed;
+}
+
+void extras_wake() {
+    s_wakeUntil = millis() + WAKE_MS;
+}
+
+void extras_ack_block() {
+    s_blockAck = true;
+}
+
+// ============================================================
+// Notifications (ntfy.sh over plain HTTP - no TLS cost on the miner)
+// ============================================================
+
+bool extras_notify(const char *title, const char *message, const char *tags, int priority) {
+    if (!s_cfg.ntfyTopic[0] || WiFi.status() != WL_CONNECTED) return false;
+
+    char url[96];
+    snprintf(url, sizeof(url), "http://ntfy.sh/%s", s_cfg.ntfyTopic);
+
+    WiFiClient client;
+    HTTPClient http;
+    http.setTimeout(5000);
+    if (!http.begin(client, url)) return false;
+    http.addHeader("Title", title);
+    if (tags && tags[0]) http.addHeader("Tags", tags);
+    http.addHeader("Priority", String(priority));
+    int code = http.POST((uint8_t *)message, strlen(message));
+    http.end();
+
+    Serial.printf("[NOTIFY] '%s' -> %d\n", title, code);
+    return code == 200;
+}
+
+static void fmtDuration(char *out, size_t cap, uint32_t seconds) {
+    uint32_t d = seconds / 86400, h = seconds % 86400 / 3600, m = seconds % 3600 / 60;
+    if (d) snprintf(out, cap, "%lud %luh", (unsigned long)d, (unsigned long)h);
+    else if (h) snprintf(out, cap, "%luh %lum", (unsigned long)h, (unsigned long)m);
+    else snprintf(out, cap, "%lum", (unsigned long)m);
+}
+
+static const char* resetReasonText() {
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:  return "power on";
+        case ESP_RST_SW:       return "restart";
+        case ESP_RST_PANIC:    return "crash (panic)";
+        case ESP_RST_INT_WDT:
+        case ESP_RST_TASK_WDT:
+        case ESP_RST_WDT:      return "watchdog";
+        case ESP_RST_BROWNOUT: return "brownout (weak power supply?)";
+        case ESP_RST_DEEPSLEEP:return "deep sleep";
+        default:               return "other";
+    }
+}
+
+// ============================================================
+// RGB LED
+// ============================================================
+
+static void ledSet(bool r, bool g, bool b) {
+    #ifdef HAVE_RGB_LED
+        digitalWrite(LED_R_PIN, r ? LED_ON : LED_OFF);
+        digitalWrite(LED_G_PIN, g ? LED_ON : LED_OFF);
+        digitalWrite(LED_B_PIN, b ? LED_ON : LED_OFF);
+    #endif
+}
+
+// Called every 100 ms
+static void ledUpdate(bool wifiUp, bool poolUp, bool shareFlash, bool blockParty, bool night) {
+    static uint8_t tick = 0;
+    tick++;
+    if (blockParty) {
+        // Cycle colors until acknowledged (tap / BOOT click)
+        uint8_t phase = (tick / 3) % 6;
+        static const bool seq[6][3] = {{1,0,0},{1,1,0},{0,1,0},{0,1,1},{0,0,1},{1,0,1}};
+        ledSet(seq[phase][0], seq[phase][1], seq[phase][2]);
+        return;
+    }
+    if (!s_cfg.ledEnabled || night) { ledSet(0, 0, 0); return; }
+    if (shareFlash)  { ledSet(0, 1, 0); return; }                  // Green flash: share accepted
+    if (!wifiUp)     { ledSet((tick % 10) < 2, 0, 0); return; }    // Red blink: no WiFi
+    if (!poolUp)     { ledSet(0, 0, (tick % 10) < 2); return; }    // Blue blink: no pool
+    ledSet(0, 0, 0);                                               // Mining normally: dark
+}
+
+// ============================================================
+// WiFi roaming: move to a clearly stronger AP with the same SSID
+// ============================================================
+
+static void roamCheck() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    int cur = WiFi.RSSI();
+    if (cur >= ROAM_RSSI_WEAK) return;
+
+    miner_config_t *config = nvs_config_get();
+    String ssid = WiFi.SSID();
+    uint8_t curBssid[6];
+    memcpy(curBssid, WiFi.BSSID(), 6);
+
+    int n = WiFi.scanNetworks(false, false, false, 120);
+    int best = -1;
+    for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i) != ssid) continue;
+        if (best < 0 || WiFi.RSSI(i) > WiFi.RSSI(best)) best = i;
+    }
+    if (best >= 0 && memcmp(WiFi.BSSID(best), curBssid, 6) != 0 &&
+        WiFi.RSSI(best) >= cur + ROAM_RSSI_GAIN) {
+        uint8_t bssid[6];
+        memcpy(bssid, WiFi.BSSID(best), 6);
+        int ch = WiFi.channel(best);
+        Serial.printf("[WIFI] Roaming: %d dBm -> %d dBm (ch %d)\n", cur, WiFi.RSSI(best), ch);
+        WiFi.scanDelete();
+        WiFi.begin(config->ssid, config->wifiPassword, ch, bssid);
+        return;
+    }
+    WiFi.scanDelete();
+}
+
+// ============================================================
+// Task
+// ============================================================
+
+void extras_task(void *param) {
+    Serial.printf("[EXTRAS] Task started on core %d\n", xPortGetCoreID());
+    miner_config_t *config = nvs_config_get();
+
+    bool bootNotified = false;
+    uint32_t wifiDownSince = 0, poolDownSince = 0;
+    bool poolOutageReported = false;
+    uint32_t lastAccepted = miner_get_stats()->accepted;
+    uint32_t lastBlocks = miner_get_stats()->blocks;
+    uint32_t shareFlashUntil = 0;
+    bool blockParty = false;
+    uint32_t lastRoam = millis();
+    int lastDailyYday = -1;
+    uint32_t lastSlow = 0;
+    bool night = false;
+    uint32_t zeroHashSince = 0;
+
+    for (;;) {
+        uint32_t now = millis();
+        bool wifiUp = WiFi.status() == WL_CONNECTED;
+        bool poolUp = stratum_is_connected();
+        mining_stats_t *ms = miner_get_stats();
+
+        // --- Share / block events (checked every 100 ms) ---
+        if (ms->accepted != lastAccepted) {
+            lastAccepted = ms->accepted;
+            shareFlashUntil = now + 400;
+        }
+        if (ms->blocks != lastBlocks) {
+            lastBlocks = ms->blocks;
+            blockParty = true;
+            s_blockAck = false;
+            char msg[160];
+            snprintf(msg, sizeof(msg), "Your miner found a Bitcoin block! Check your wallet: %s", config->wallet);
+            extras_notify("BLOCK FOUND!", msg, "tada,moneybag", 5);
+        }
+        if (blockParty && s_blockAck) blockParty = false;
+
+        ledUpdate(wifiUp, poolUp, (int32_t)(shareFlashUntil - now) > 0, blockParty, night);
+
+        // --- Once per second ---
+        if (now - lastSlow >= 1000) {
+            lastSlow = now;
+
+            // Boot notification once WiFi is up
+            if (!bootNotified && wifiUp) {
+                bootNotified = true;
+                char msg[160];
+                snprintf(msg, sizeof(msg), "Reason: %s\nIP: %s\nSignal: %d dBm",
+                         resetReasonText(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+                extras_notify("Miner started", msg, "zap", 2);
+            }
+
+            // WiFi outage tracking + watchdog
+            if (!wifiUp) {
+                if (!wifiDownSince) wifiDownSince = now;
+                if (now - wifiDownSince > WIFI_RESTART_MS) {
+                    Serial.println("[WIFI] No WiFi for 5 minutes - rebooting (setup hotspot opens if still unreachable)");
+                    delay(100);
+                    ESP.restart();
+                }
+            } else if (wifiDownSince) {
+                uint32_t outage = now - wifiDownSince;
+                wifiDownSince = 0;
+                if (outage > OUTAGE_NOTIFY_MS) {
+                    char d[16], msg[96];
+                    fmtDuration(d, sizeof(d), outage / 1000);
+                    snprintf(msg, sizeof(msg), "WiFi was down for %s, back online now.", d);
+                    extras_notify("Miner back online", msg, "white_check_mark", 3);
+                }
+            }
+
+            // Pool outage (while WiFi works)
+            if (wifiUp && !poolUp) {
+                if (!poolDownSince) poolDownSince = now;
+                if (!poolOutageReported && now - poolDownSince > OUTAGE_NOTIFY_MS) {
+                    poolOutageReported = extras_notify("Pool disconnected",
+                        "WiFi is fine but the miner has not reached the pool for 10 minutes.", "warning", 4);
+                }
+            } else if (poolUp && poolDownSince) {
+                if (poolOutageReported) {
+                    char d[16], msg[96];
+                    fmtDuration(d, sizeof(d), (now - poolDownSince) / 1000);
+                    snprintf(msg, sizeof(msg), "Pool connection restored after %s.", d);
+                    extras_notify("Pool reconnected", msg, "white_check_mark", 3);
+                }
+                poolDownSince = 0;
+                poolOutageReported = false;
+            }
+
+            // "Connected but dead": pool link up yet nothing hashing for 90 s -> reconnect
+            if (poolUp && monitor_get_data()->hashRate < 1.0) {
+                if (!zeroHashSince) zeroHashSince = now;
+                if (now - zeroHashSince > 90000) {
+                    Serial.println("[EXTRAS] Pool connected but hashrate 0 for 90 s - reconnecting");
+                    stratum_reconnect();
+                    zeroHashSince = 0;
+                }
+            } else {
+                zeroHashSince = 0;
+            }
+
+            // Local time: night mode + daily summary
+            struct tm t;
+            bool haveTime = getLocalTime(&t, 0);
+            if (haveTime) {
+                bool inWindow = s_cfg.nightStart <= s_cfg.nightEnd
+                    ? (t.tm_hour >= s_cfg.nightStart && t.tm_hour < s_cfg.nightEnd)
+                    : (t.tm_hour >= s_cfg.nightStart || t.tm_hour < s_cfg.nightEnd);
+                night = s_cfg.nightEnabled && inWindow;
+
+                if (s_cfg.notifyDaily && t.tm_hour == 9 && t.tm_yday != lastDailyYday) {
+                    lastDailyYday = t.tm_yday;
+                    const display_data_t *d = monitor_get_data();
+                    char up[16], msg[200];
+                    fmtDuration(up, sizeof(up), d->uptimeSeconds);
+                    snprintf(msg, sizeof(msg),
+                        "Hashrate: %.0f kH/s\nShares: %lu accepted\nBest difficulty: %.4g\nBlocks: %lu\nUptime: %s\nSignal: %d dBm",
+                        d->hashRate / 1000.0, (unsigned long)d->sharesAccepted, d->bestDifficulty,
+                        (unsigned long)d->blocksFound, up, WiFi.RSSI());
+                    extras_notify("Daily miner report", msg, "bar_chart", 2);
+                }
+            }
+
+            // Backlight: night level unless woken by a tap
+            bool wantDim = night && (int32_t)(s_wakeUntil - now) <= 0;
+            if (wantDim != s_dimmed) {
+                s_dimmed = wantDim;
+                display_set_brightness(wantDim ? s_cfg.nightBright : config->brightness);
+            }
+
+            // Signed self-update from GitHub Releases (on schedule or when asked)
+            if (wifiUp) fw_update_poll(s_cfg.autoUpdate);
+
+            // Roaming between access points with the same name
+            if (wifiUp && now - lastRoam >= ROAM_CHECK_MS) {
+                lastRoam = now;
+                roamCheck();
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
