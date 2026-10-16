@@ -35,8 +35,8 @@ void fw_update_poll(bool autoUpdate);
 void fw_update_boot();
 
 /**
- * Every second: confirm new firmware once the pool is reached, or roll back
- * after 5 minutes without it
+ * Every second: confirm new firmware after 3 minutes up with the pool, or roll
+ * back after 10 minutes without it; also resets the crash-loop counter
  */
 void fw_update_health(bool poolUp);
 
