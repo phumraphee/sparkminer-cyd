@@ -40,6 +40,7 @@
 static extras_config_t s_cfg;
 static volatile bool s_dimmed = false;
 static volatile uint32_t s_wakeUntil = 0;
+static volatile uint32_t s_lastActivity = 0;
 static volatile bool s_blockAck = false;
 
 // ============================================================
@@ -55,6 +56,7 @@ static void loadDefaults(extras_config_t *c) {
     c->nightBright = 5;
     c->ledEnabled = true;
     c->autoUpdate = true;
+    c->screenOffMin = 0;
 }
 
 void extras_init() {
@@ -70,6 +72,7 @@ void extras_init() {
         s_cfg.nightBright  = p.getUChar("n_bright", s_cfg.nightBright);
         s_cfg.ledEnabled   = p.getBool("led", s_cfg.ledEnabled);
         s_cfg.autoUpdate   = p.getBool("auto_up", s_cfg.autoUpdate);
+        s_cfg.screenOffMin = p.getUChar("scr_off", s_cfg.screenOffMin);
         p.end();
     }
 
@@ -99,6 +102,7 @@ bool extras_save() {
     p.putUChar("n_bright", s_cfg.nightBright);
     p.putBool("led", s_cfg.ledEnabled);
     p.putBool("auto_up", s_cfg.autoUpdate);
+    p.putUChar("scr_off", s_cfg.screenOffMin);
     p.end();
     return true;
 }
@@ -145,8 +149,17 @@ bool extras_is_dimmed() {
     return s_dimmed;
 }
 
+void extras_activity() {
+    s_lastActivity = millis();
+}
+
 void extras_wake() {
+    s_lastActivity = millis();
     s_wakeUntil = millis() + WAKE_MS;
+    if (s_dimmed) {   // Light up right away rather than on the next 1 s tick
+        s_dimmed = false;
+        display_set_brightness(nvs_config_get()->brightness);
+    }
 }
 
 void extras_ack_block() {
@@ -268,6 +281,7 @@ static void roamCheck() {
 
 void extras_task(void *param) {
     Serial.printf("[EXTRAS] Task started on core %d\n", xPortGetCoreID());
+    s_lastActivity = millis();
     miner_config_t *config = nvs_config_get();
 
     bool bootNotified = false;
@@ -409,10 +423,17 @@ void extras_task(void *param) {
             }
 
             // Backlight: night level unless woken by a tap
-            bool wantDim = night && (int32_t)(s_wakeUntil - now) <= 0;
-            if (wantDim != s_dimmed) {
+            // Backlight: off after the idle timeout, night level in the night window
+            // (a tap wakes it: until the next timeout by day, for a minute at night)
+            bool idleOff = s_cfg.screenOffMin && now - s_lastActivity > s_cfg.screenOffMin * 60000UL;
+            bool nightDim = night && (int32_t)(s_wakeUntil - now) <= 0;
+            bool wantDim = (idleOff || nightDim) && !blockParty;
+            uint8_t level = idleOff ? 0 : s_cfg.nightBright;
+            static uint8_t appliedLevel = 255;
+            if (wantDim != s_dimmed || (wantDim && level != appliedLevel)) {
                 s_dimmed = wantDim;
-                display_set_brightness(wantDim ? s_cfg.nightBright : config->brightness);
+                appliedLevel = wantDim ? level : 255;
+                display_set_brightness(wantDim ? level : config->brightness);
             }
 
             // Signed self-update from GitHub Releases (on schedule or when asked)

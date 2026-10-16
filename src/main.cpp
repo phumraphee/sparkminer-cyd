@@ -55,6 +55,7 @@ void onButtonClick() {
     if (wifi_ui_is_open()) { wifi_ui_close(); return; }
     extras_ack_block();
     if (extras_is_dimmed()) { extras_wake(); return; }
+    extras_activity();
     display_next_screen();
 }
 
@@ -158,7 +159,7 @@ void button_task(void *param) {
                 #endif
             } else if (pressed && now - touchStart >= 3000) {
                 // Hold 3 s: WiFi menu (once per press)
-                if (!holdFired && !wifi_ui_is_open()) wifi_ui_open();
+                if (!holdFired && !wifi_ui_is_open()) { extras_wake(); wifi_ui_open(); }
                 holdFired = true;
             } else if (pressed) {
                 #ifdef HAVE_TOUCH_POSITION
@@ -174,6 +175,7 @@ void button_task(void *param) {
                         if (tapPos) {
                             float fx, fy;
                             touch_screen_xy(tapX, tapY, nvs_config_get()->rotation, &fx, &fy);
+                            extras_activity();
                             wifi_ui_touch(fx, fy);
                         }
                     #endif
@@ -184,15 +186,15 @@ void button_task(void *param) {
                     #endif
                     extras_ack_block();
                     if (extras_is_dimmed()) {
-                        extras_wake();
-                    }
-                    #ifdef HAVE_TOUCH_POSITION
-                    else if (tapPos && touch_screen_x(tapX, tapY, nvs_config_get()->rotation) < 0.5f) {
-                        display_prev_screen();
-                    }
-                    #endif
-                    else {
-                        display_next_screen();
+                        extras_wake();          // First tap on a dark screen only wakes it
+                    } else {
+                        extras_activity();
+                        bool left = false;
+                        #ifdef HAVE_TOUCH_POSITION
+                            left = tapPos && touch_screen_x(tapX, tapY, nvs_config_get()->rotation) < 0.5f;
+                        #endif
+                        if (left) display_prev_screen();
+                        else display_next_screen();
                     }
                 }
             }
