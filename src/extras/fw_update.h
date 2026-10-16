@@ -1,7 +1,8 @@
 /*
  * SparkMiner - Self-update from GitHub Releases
  *
- * The miner polls releases/latest/download/manifest.json in UPDATE_REPO.
+ * The miner polls manifest.json on the "ota" branch of UPDATE_REPO
+ * (raw.githubusercontent.com; deploy.sh force-pushes it with every release).
  * A newer build is downloaded, its SHA-256 checked, and the ECDSA P-256
  * signature over "<build>:<sha256hex>" verified against the public key
  * compiled in below before it is activated. The private key never leaves

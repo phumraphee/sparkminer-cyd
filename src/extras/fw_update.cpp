@@ -100,7 +100,9 @@ static void checkNow() {
         WiFiClientSecure client;
         HTTPClient http;
         miner_sha_hold();
-        bool ok = httpsGet(http, client, "https://github.com/" UPDATE_REPO "/releases/latest/download/manifest.json");
+        // raw.githubusercontent.com serves files directly (Release downloads go through
+        // two redirects to a ~900-char signed URL, which the ESP32 HTTP client can't follow)
+        bool ok = httpsGet(http, client, "https://raw.githubusercontent.com/" UPDATE_REPO "/ota/manifest.json");
         String body = ok ? http.getString() : String();
         http.end();
         miner_sha_release();
@@ -112,12 +114,13 @@ static void checkNow() {
     uint32_t size = m["size"] | 0;
     const char *shaHex = m["sha256"] | "";
     const char *sig = m["sig"] | "";
+    const char *file = m["file"] | "";
 
     if (build <= FW_BUILD) {
         setState("Up to date (%s)", tag[0] ? tag : AUTO_VERSION);
         return;
     }
-    if (!tag[0] || !size || strlen(shaHex) != 64 || !sig[0]) {
+    if (!tag[0] || !file[0] || !size || strlen(shaHex) != 64 || !sig[0]) {
         setState("Manifest incomplete");
         return;
     }
@@ -138,7 +141,7 @@ static void checkNow() {
     WiFiClientSecure client;
     HTTPClient http;
     miner_sha_hold();
-    String url = String("https://github.com/" UPDATE_REPO "/releases/download/") + tag + "/firmware.bin";
+    String url = String("https://raw.githubusercontent.com/" UPDATE_REPO "/ota/") + file;
     if (!httpsGet(http, client, url) || http.getSize() != (int)size) {
         http.end();
         miner_sha_release();
