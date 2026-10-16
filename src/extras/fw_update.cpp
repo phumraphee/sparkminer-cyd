@@ -131,7 +131,10 @@ static void checkNow() {
         expected[i] = (uint8_t)strtoul(b, nullptr, 16);
     }
     // Check the signature before downloading anything
-    if (!verifySignature(build, expected, sig)) {
+    miner_sha_hold();   // The digest is computed with the SHA unit the miner drives directly
+    bool sigOk = verifySignature(build, expected, sig);
+    miner_sha_release();
+    if (!sigOk) {
         setState("Bad signature on %s - ignored", tag);
         return;
     }
