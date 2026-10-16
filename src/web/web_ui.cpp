@@ -101,6 +101,8 @@ button.sec{background:#2c2c2c;color:var(--fg)}small{color:var(--mut)}.msg{color:
 <label class="ck"><input type="checkbox" name="night" value="1">Night mode (dim screen, LED off)</label>
 <div class="row3"><div><label>From (hour)</label><input name="n_start" type="number" min="0" max="23"></div><div><label>To (hour)</label><input name="n_end" type="number" min="0" max="23"></div><div><label>Night brightness %</label><input name="n_bright" type="number" min="0" max="100"></div></div>
 <small>0% turns the screen off. Tap the screen to light it up for a minute.</small>
+<label>Turn the screen off when not touched for</label><select name="scr_off"><option value="0">Never</option><option value="1">1 minute</option><option value="5">5 minutes</option><option value="15">15 minutes</option><option value="30">30 minutes</option><option value="60">1 hour</option></select>
+<small>Tap the screen or press BOOT to wake it (the first tap only wakes).</small>
 <label class="ck"><input type="checkbox" name="led" value="1">Status LED (red blink = no WiFi, blue blink = no pool, green flash = share)</label>
 <label class="ck"><input type="checkbox" name="https" value="1">Live BTC price &amp; network stats (HTTPS from the miner)</label>
 </div>
@@ -280,6 +282,7 @@ static void handleStatus() {
     j += ",\"version\":";   jsonStr(j, AUTO_VERSION);
     j += ",\"reset_reason\":"; j += (int)esp_reset_reason();
     j += ",\"build\":";     j += (uint32_t)FW_BUILD;
+    j += ",\"screen_on\":"; j += extras_is_dimmed() ? "false" : "true";
     j += ",\"update\":";    jsonStr(j, fw_update_state());
     #ifdef HAVE_TOUCH_POSITION
         uint16_t th[4][2];
@@ -322,6 +325,7 @@ static void handleConfig() {
     j += ",\"ntfy\":";          jsonStr(j, x->ntfyTopic);
     j += ",\"daily\":";         j += x->notifyDaily ? 1 : 0;
     j += ",\"auto_up\":";       j += x->autoUpdate ? 1 : 0;
+    j += ",\"scr_off\":";       j += x->screenOffMin;
     j += ",\"has_pin\":";       j += x->pin[0] ? "true" : "false";
     j += "}";
     s_server.send(200, "application/json", j);
@@ -385,6 +389,7 @@ static void handleSave() {
     if (s_server.hasArg("n_bright")) x->nightBright = constrain(s_server.arg("n_bright").toInt(), 0, 100);
     x->ledEnabled = argFlag("led", x->ledEnabled);
     x->autoUpdate = argFlag("auto_up", x->autoUpdate);
+    if (s_server.hasArg("scr_off")) x->screenOffMin = constrain(s_server.arg("scr_off").toInt(), 0, 240);
     x->notifyDaily = argFlag("daily", x->notifyDaily);
     if (s_server.hasArg("ntfy")) strlcpy(x->ntfyTopic, topic.c_str(), sizeof(x->ntfyTopic));
     if (removePin) x->pin[0] = '\0';

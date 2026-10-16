@@ -22,6 +22,7 @@ typedef struct {
     uint8_t nightBright;    // Backlight % during the night (0 = off)
     bool ledEnabled;        // RGB status LED
     bool autoUpdate;        // Install signed releases from GitHub automatically
+    uint8_t screenOffMin;   // Turn the backlight off after this many minutes without a tap (0 = never)
 } extras_config_t;
 
 void extras_init();
@@ -39,9 +40,15 @@ void extras_task(void *param);
 bool extras_is_dimmed();
 
 /**
- * Temporarily restore full brightness (e.g. screen was tapped at night)
+ * Screen was tapped / button pressed while dark: light it up again
+ * (for a minute at night, until the idle timeout otherwise)
  */
 void extras_wake();
+
+/**
+ * Any tap or button press: restarts the screen-off timer
+ */
+void extras_activity();
 
 /**
  * Acknowledge the block-found LED celebration
