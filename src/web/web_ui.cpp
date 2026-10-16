@@ -23,6 +23,7 @@
 #include "../extras/fw_update.h"
 #include "../config/wifi_store.h"
 #include "../extras/history.h"
+#include "../ui/touch_cal.h"
 
 static WebServer s_server(80);
 static bool s_started = false;
@@ -160,6 +161,7 @@ button.sec{background:#2c2c2c;color:var(--fg)}small{color:var(--mut)}.msg{color:
 <small id="ust">Update status: -</small>
 <button type="button" class="sec" id="cu">Check for update now</button>
 <button type="button" class="sec" id="wp">Open WiFi setup hotspot</button>
+<button type="button" class="sec" id="tc">Calibrate touch screen</button>
 <button type="button" class="sec" id="rb">Restart</button>
 <label>Firmware update (.bin)</label><input type="file" id="fw" accept=".bin">
 <button type="button" class="sec" id="up">Upload firmware</button>
@@ -250,6 +252,7 @@ $('odds').innerHTML=rows.map(function(r){return '<span>'+r[0]+'</span><b>'+r[1]+
 $('lcb').onclick=function(){var p=new URLSearchParams();p.append('which','bright');post('/api/light-cal',p,'msg')};
 $('lcd').onclick=function(){var p=new URLSearchParams();p.append('which','dark');post('/api/light-cal',p,'msg')};
 $('cu').onclick=function(){post('/api/check-update','','msg2')};
+$('tc').onclick=function(){post('/api/touch-cal','','msg2')};
 $('rb').onclick=function(){if(confirm('Restart the miner?'))post('/api/restart','','msg2')};
 $('wp').onclick=function(){if(confirm('Reboot into the WiFi setup hotspot? Mining pauses until it is set up or 5 minutes pass.'))post('/api/portal','','msg2')};
 $('up').onclick=function(){var f=$('fw').files[0];if(!f){say('msg2','Choose a .bin file first',1);return}
@@ -569,6 +572,12 @@ static void handleLightCal() {
     s_server.send(200, "text/plain", msg);
 }
 
+static void handleTouchCal() {
+    if (!requirePin()) return;
+    touch_cal_start();
+    s_server.send(200, "text/plain", "Calibration started on the miner's screen - tap the four crosshairs.");
+}
+
 static void handleCheckUpdate() {
     if (!requirePin()) return;
     fw_update_request();
@@ -684,6 +693,7 @@ void web_ui_start() {
     s_server.on("/api/check-update", HTTP_POST, handleCheckUpdate);
     s_server.on("/api/wifi", HTTP_GET, handleWifiList);
     s_server.on("/api/history", HTTP_GET, handleHistory);
+    s_server.on("/api/touch-cal", HTTP_POST, handleTouchCal);
     s_server.on("/api/light-cal", HTTP_POST, handleLightCal);
     s_server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
     s_server.on("/api/wifi/add", HTTP_POST, handleWifiAdd);

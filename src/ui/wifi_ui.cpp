@@ -13,6 +13,7 @@
 #include "../config/wifi_store.h"
 #include "../config/wifi_manager.h"
 #include "../extras/extras.h"
+#include "touch_cal.h"
 
 #define C_BG      0x0000
 #define C_FG      0xFFFF
@@ -29,7 +30,7 @@
 #define MAX_ITEMS       24
 #define MAX_PASS        64
 
-enum State { ST_LIST, ST_ACTION, ST_KEYPAD, ST_SYMBOLS, ST_CONNECTING, ST_RESULT };
+enum State { ST_LIST, ST_ACTION, ST_KEYPAD, ST_SYMBOLS, ST_CONNECTING, ST_RESULT, ST_MORE };
 enum Mode { M_LOWER, M_UPPER, M_DIGITS };
 
 struct Item { char ssid[33]; int rssi; bool secure; bool saved; bool inRange; };
@@ -52,6 +53,7 @@ static bool s_showPass = false;
 static bool s_resultOk = false;
 static bool s_dirty = true;
 static uint32_t s_lastTap = 0;
+static int s_drawnState = -1;               // View currently on screen (-1 = repaint all)
 
 // Multi-tap letters per key (index 0..9 = keys 1..9, 0)
 static const char *KEYS_LOWER[10] = {".,!?@-_1", "abc2", "def3", "ghi4", "jkl5", "mno6", "pqrs7", "tuv8", "wxyz9", "0 "};
@@ -111,6 +113,7 @@ static void fit(char *out, const char *in, int maxChars) {
 // ============================================================
 
 static void scan() {
+    s_drawnState = -1;
     display_lock();
     tft->fillScreen(C_BG);
     title("WiFi");
@@ -164,8 +167,9 @@ static void scan() {
 
 static int listRows() { return (H - 32 - 46) / 30; }
 
-static void drawList() {
-    tft->fillScreen(C_BG);
+static void drawList(bool full) {
+    if (full) tft->fillScreen(C_BG);
+    else tft->fillRect(0, 28, W, H - 28 - 44, C_BG);
     char right[40];
     if (WiFi.status() == WL_CONNECTED) {
         char s[20];
@@ -207,7 +211,7 @@ static void drawList() {
     button(0, y, bw, 44, "^", s_scroll > 0 ? C_KEY : C_BG, C_FG);
     button(bw, y, bw, 44, "v", s_scroll + rows < s_nItems ? C_KEY : C_BG, C_FG);
     button(2 * bw, y, bw, 44, "Scan", C_KEY, C_FG, 1);
-    button(3 * bw, y, bw, 44, "Hotspot", C_KEY, C_FG, 1);
+    button(3 * bw, y, bw, 44, "More", C_KEY, C_FG, 1);
     button(4 * bw, y, W - 4 * bw, 44, "Close", C_KEY, C_ACCENT, 1);
 }
 
@@ -219,7 +223,7 @@ static void tapList(const Tap &t) {
     if (hit(t, 0, y, bw, 44)) { if (s_scroll > 0) s_scroll -= rows - 1; if (s_scroll < 0) s_scroll = 0; return; }
     if (hit(t, bw, y, bw, 44)) { if (s_scroll + rows < s_nItems) s_scroll += rows - 1; return; }
     if (hit(t, 2 * bw, y, bw, 44)) { scan(); return; }
-    if (hit(t, 3 * bw, y, bw, 44)) { extras_request_portal(); return; }   // Reboots
+    if (hit(t, 3 * bw, y, bw, 44)) { s_state = ST_MORE; return; }
     if (hit(t, 4 * bw, y, W - 4 * bw, 44)) { wifi_ui_close(); return; }
     for (int r = 0; r < rows && s_scroll + r < s_nItems; r++) {
         if (!hit(t, 4, 32 + r * 30, W - 8, 27)) continue;
@@ -238,6 +242,32 @@ static void tapList(const Tap &t) {
         }
         return;
     }
+}
+
+// ============================================================
+// More: setup hotspot, touch calibration
+// ============================================================
+
+static void drawMore() {
+    tft->fillScreen(C_BG);
+    title("More");
+    int bh = 52, y = 48, x = 16, w = W - 32;
+    button(x, y, w, bh, "Setup hotspot", C_KEY, C_FG);
+    tft->setTextDatum(TC_DATUM);
+    tft->setTextSize(1);
+    tft->setTextColor(C_DIM, C_BG);
+    char pw[40];
+    snprintf(pw, sizeof(pw), "Password: %s", extras_ap_password());
+    tft->drawString(pw, W / 2, y + bh + 4);
+    button(x, y + bh + 24, w, bh, "Calibrate touch", C_KEY, C_FG);
+    button(x, y + 2 * bh + 48, w, bh, "Back", C_KEY, C_ACCENT);
+}
+
+static void tapMore(const Tap &t) {
+    int bh = 52, y = 48, x = 16, w = W - 32;
+    if (hit(t, x, y, w, bh)) extras_request_portal();   // Reboots into the hotspot
+    else if (hit(t, x, y + bh + 24, w, bh)) { wifi_ui_close(); touch_cal_start(); }
+    else if (hit(t, x, y + 2 * bh + 48, w, bh)) s_state = ST_LIST;
 }
 
 // ============================================================
@@ -291,8 +321,8 @@ static int keyH() { return (H - headerH() - 42) / 4; }
 
 static void commitPending() { s_pendKey = -1; }
 
-static void drawKeypad() {
-    tft->fillScreen(C_BG);
+static void drawKeypad(bool full) {
+    if (full) tft->fillScreen(C_BG);
     char name[40];
     fit(name, s_items[s_sel].ssid, (W - 40) / 6);
     tft->fillRect(0, 0, W, headerH(), C_PANEL);
@@ -355,8 +385,9 @@ static void drawKeypad() {
         tft->drawString(sub, x + kw / 2, y + kh / 2 + (kh > 44 ? 12 : 9));
     }
 
-    // Actions
+    // Actions (only the eye label changes)
     int ay = H - 40, aw = W / 4;
+    if (!full) { button(aw, ay, aw, 40, s_showPass ? "hide" : "show", C_KEY, C_FG, 1); return; }
     button(0, ay, aw, 40, "<-", C_KEY, C_FG);
     button(aw, ay, aw, 40, s_showPass ? "hide" : "show", C_KEY, C_FG, 1);
     button(2 * aw, ay, aw, 40, "Cancel", C_KEY, C_ACCENT, 1);
@@ -438,6 +469,7 @@ static void tapSymbols(const Tap &t) {
 // ============================================================
 
 static void message(const char *line1, const char *line2, uint16_t color) {
+    s_drawnState = -1;
     display_lock();
     tft->fillScreen(C_BG);
     title("WiFi");
@@ -513,20 +545,26 @@ static void tapResult(const Tap &t) {
 // ============================================================
 
 static void redraw() {
+    // Repaint the whole screen only when the view changes; within a view only
+    // the changing parts are redrawn (no full-screen flash on every key press)
+    bool full = s_state != s_drawnState;
     display_lock();
     switch (s_state) {
-        case ST_LIST:    drawList(); break;
+        case ST_LIST:    drawList(full); break;
         case ST_ACTION:  drawAction(); break;
-        case ST_KEYPAD:  drawKeypad(); break;
+        case ST_KEYPAD:  drawKeypad(full); break;
         case ST_SYMBOLS: drawSymbols(); break;
         case ST_RESULT:  drawResult(); break;
+        case ST_MORE:    drawMore(); break;
         default: break;
     }
     display_unlock();
+    s_drawnState = s_state;
     s_dirty = false;
 }
 
 static void uiTask(void *param) {
+    s_drawnState = -1;
     display_take(true);
     tft = display_tft();
     W = tft->width();
@@ -546,6 +584,7 @@ static void uiTask(void *param) {
                 case ST_KEYPAD:  tapKeypad(t); break;
                 case ST_SYMBOLS: tapSymbols(t); break;
                 case ST_RESULT:  tapResult(t); break;
+                case ST_MORE:    tapMore(t); break;
                 default: break;
             }
             s_dirty = true;
