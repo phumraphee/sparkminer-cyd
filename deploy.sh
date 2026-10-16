@@ -44,11 +44,24 @@ if [[ "$MODE" == "" && -n "$REPO" ]]; then
     OUT=".pio/build/$ENV/release"
     mkdir -p "$OUT"
     cp "$BIN" "$OUT/firmware.bin"
-    printf '{"build":%s,"tag":"%s","size":%s,"sha256":"%s","sig":"%s"}\n' \
-        "$BUILD" "$TAG" "$SIZE" "$SHA" "$SIG" > "$OUT/manifest.json"
+    FILE="fw-$BUILD.bin"
+    printf '{"build":%s,"tag":"%s","file":"%s","size":%s,"sha256":"%s","sig":"%s"}\n' \
+        "$BUILD" "$TAG" "$FILE" "$SIZE" "$SHA" "$SIG" > "$OUT/manifest.json"
     git push -q origin HEAD:main 2>/dev/null || true
     gh release create "$TAG" "$OUT/firmware.bin" "$OUT/manifest.json" \
         --repo "$REPO" --title "$TAG" --notes "$(git log -1 --pretty=%s)" --latest >/dev/null
+    # What the miners actually download: a one-commit "ota" branch on raw.githubusercontent.com
+    OTA=$(mktemp -d)
+    cp "$OUT/manifest.json" "$OTA/manifest.json"
+    cp "$BIN" "$OTA/$FILE"
+    (
+        cd "$OTA"
+        git init -q -b ota
+        git add .
+        git -c user.email=phumraphee@gmail.com -c user.name=phumraphee commit -q -m "OTA $TAG"
+        git push -q -f "https://github.com/$REPO.git" ota:ota
+    )
+    rm -rf "$OTA"
     echo "Released $TAG on github.com/$REPO"
 fi
 
