@@ -31,7 +31,10 @@ static const char UPDATE_PUBKEY[] =
     "+8IAEIAuc/i07ZyhjumELzUCNfXKGZAK/NFqTJQVScdTgsC/F6EzsGQ+IA==\n"
     "-----END PUBLIC KEY-----\n";
 
-#define HEALTHY_WITHIN_MS (5UL * 60 * 1000)   // New firmware must reach the pool within this
+#define CONFIRM_AFTER_MS  (3UL * 60 * 1000)   // New firmware must stay up this long with the pool...
+#define HEALTHY_WITHIN_MS (10UL * 60 * 1000)  // ...and get there within this, or it is rolled back
+#define SHORT_BOOT_MS     (2UL * 60 * 1000)   // A boot that dies sooner counts towards a crash loop
+#define CRASH_LOOP_BOOTS  4
 
 // Keep the bootloader's rollback armed after an OTA (Arduino confirms every image at
 // boot by default). fw_update_health() confirms it once the pool is reachable;
@@ -95,51 +98,61 @@ static bool verifySignature(uint32_t build, const uint8_t sha[32], const char *s
     return ok;
 }
 
-// One download attempt straight into the spare OTA slot; true once activated
+// Download straight into the spare OTA slot, resuming with HTTP Range after a drop
+// (keeps one Update session and one running hash); true once activated
 static bool downloadAndInstall(const char *tag, const char *file, uint32_t size, const uint8_t expected[32]) {
-    setState("Downloading %s", tag);
-    WiFiClientSecure client;
-    HTTPClient http;
-    miner_sha_hold();
     String url = String("https://raw.githubusercontent.com/" UPDATE_REPO "/ota/") + file;
-    if (!httpsGet(http, client, url) || http.getSize() != (int)size) {
-        http.end();
-        miner_sha_release();
-        setState("Download failed to start");
-        return false;
-    }
+    miner_sha_hold();
     if (!Update.begin(size, U_FLASH)) {
-        http.end();
         miner_sha_release();
-        setState("Update begin failed");
+        setState("Update begin failed: %s", Update.errorString());
         return false;
     }
 
     mbedtls_sha256_context ctx;
     mbedtls_sha256_init(&ctx);
     mbedtls_sha256_starts_ret(&ctx, 0);
-
-    WiFiClient *stream = http.getStreamPtr();
     static uint8_t buf[1024];
-    uint32_t got = 0, lastPct = 0, lastData = millis();
-    while (got < size && millis() - lastData < 30000) {
-        size_t avail = stream->available();
-        if (!avail) {
-            if (!stream->connected()) break;
-            vTaskDelay(pdMS_TO_TICKS(5));
-            continue;
+    uint32_t got = 0, lastPct = 0;
+    bool writeFailed = false;
+
+    for (int conn = 0; conn < 6 && got < size && !writeFailed; conn++) {
+        if (conn) {
+            setState("Connection dropped at %lu%% - resuming", (unsigned long)(got * 100 / size));
+            vTaskDelay(pdMS_TO_TICKS(3000));
         }
-        int r = stream->readBytes(buf, min(avail, sizeof(buf)));
-        if (r <= 0) continue;
-        lastData = millis();
-        mbedtls_sha256_update_ret(&ctx, buf, r);
-        if (Update.write(buf, r) != (size_t)r) break;
-        got += r;
-        vTaskDelay(1);
-        uint32_t pct = got * 100 / size;
-        if (pct >= lastPct + 10) { lastPct = pct; setState("Downloading %s: %lu%%", tag, (unsigned long)pct); }
+        WiFiClientSecure client;
+        HTTPClient http;
+        client.setInsecure();
+        client.setTimeout(15000);
+        http.setTimeout(15000);
+        http.setUserAgent("SparkMiner-CYD");
+        if (!http.begin(client, url)) continue;
+        if (got) http.addHeader("Range", String("bytes=") + got + "-");
+        int code = http.GET();
+        if (code != (got ? 206 : 200)) { http.end(); continue; }
+
+        WiFiClient *stream = http.getStreamPtr();
+        uint32_t lastData = millis();
+        while (got < size && millis() - lastData < 20000) {
+            size_t avail = stream->available();
+            if (!avail) {
+                if (!stream->connected()) break;
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            int r = stream->readBytes(buf, min(avail, min(sizeof(buf), (size_t)(size - got))));
+            if (r <= 0) continue;
+            lastData = millis();
+            mbedtls_sha256_update_ret(&ctx, buf, r);
+            if (Update.write(buf, r) != (size_t)r) { writeFailed = true; break; }
+            got += r;
+            vTaskDelay(1);
+            uint32_t pct = got * 100 / size;
+            if (pct >= lastPct + 10) { lastPct = pct; setState("Downloading %s: %lu%%", tag, (unsigned long)pct); }
+        }
+        http.end();
     }
-    http.end();
 
     uint8_t actual[32];
     mbedtls_sha256_finish_ret(&ctx, actual);
@@ -148,7 +161,8 @@ static bool downloadAndInstall(const char *tag, const char *file, uint32_t size,
     if (got != size) {
         Update.abort();
         miner_sha_release();
-        setState("Download cut off at %lu%%", (unsigned long)(got * 100 / size));
+        if (writeFailed) setState("Flash write failed: %s", Update.errorString());
+        else setState("Download failed at %lu%%", (unsigned long)(got * 100 / size));
         return false;
     }
     if (memcmp(actual, expected, 32) != 0) {
@@ -222,12 +236,7 @@ static void checkNow() {
     }
 
     // --- Firmware download (miner parked: TLS + image hash use the SHA unit) ---
-    bool installed = false;
-    for (int attempt = 1; attempt <= 3 && !installed; attempt++) {
-        if (attempt > 1) { setState("Retrying download (%d/3)", attempt); vTaskDelay(pdMS_TO_TICKS(5000)); }
-        installed = downloadAndInstall(tag, file, size, expected);
-    }
-    if (!installed) return;
+    if (!downloadAndInstall(tag, file, size, expected)) return;
 
     {
         Preferences p;
@@ -255,9 +264,32 @@ static void updateTask(void *param) {
     vTaskDelete(NULL);
 }
 
+static bool s_bootCounted = false;
+
 void fw_update_boot() {
     Preferences p;
     p.begin("sparkupd", false);
+
+    // Crash-loop guard (also covers firmware that was already confirmed): too many
+    // short-lived boots in a row -> go back to the other firmware slot if it is valid
+    uint8_t shortBoots = p.getUChar("short", 0) + 1;
+    p.putUChar("short", shortBoots);
+    s_bootCounted = true;
+    if (shortBoots >= CRASH_LOOP_BOOTS) {
+        const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+        esp_ota_img_states_t ost;
+        bool otherOk = other && other != esp_ota_get_running_partition() &&
+                       (esp_ota_get_state_partition(other, &ost) != ESP_OK || ost == ESP_OTA_IMG_VALID);
+        if (otherOk && esp_ota_set_boot_partition(other) == ESP_OK) {
+            p.putUInt("bad", (uint32_t)FW_BUILD);
+            p.putUChar("short", 0);
+            p.end();
+            Serial.println("[UPDATE] Crash loop detected - switching back to the previous firmware");
+            delay(200);
+            ESP.restart();
+        }
+    }
+
     s_badBuild = p.getUInt("bad", 0);
     uint32_t pending = p.getUInt("pending", 0);
 
@@ -282,8 +314,14 @@ void fw_update_boot() {
 }
 
 void fw_update_health(bool poolUp) {
+    // Survived long enough: this boot doesn't count towards a crash loop
+    if (s_bootCounted && millis() > SHORT_BOOT_MS) {
+        s_bootCounted = false;
+        Preferences p;
+        if (p.begin("sparkupd", false)) { p.putUChar("short", 0); p.end(); }
+    }
     if (!s_pendingVerify) return;
-    if (poolUp) {
+    if (poolUp && millis() > CONFIRM_AFTER_MS) {
         esp_ota_mark_app_valid_cancel_rollback();
         s_pendingVerify = false;
         Preferences p;
