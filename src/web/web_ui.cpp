@@ -22,6 +22,7 @@
 #include "../display/touch_cyd.h"
 #include "../extras/fw_update.h"
 #include "../config/wifi_store.h"
+#include "../extras/history.h"
 
 static WebServer s_server(80);
 static bool s_started = false;
@@ -62,6 +63,10 @@ input[type=checkbox]{width:auto;margin-right:8px;vertical-align:middle}label.ck{
 button{margin-top:12px;width:100%;padding:11px;border:0;border-radius:8px;background:var(--acc);color:#000;font-weight:600;font-size:15px}
 button.sec{background:#2c2c2c;color:var(--fg)}small{color:var(--mut)}.msg{color:var(--ok);margin-top:8px;min-height:1em}.err{color:var(--bad)}
 #pinbar{display:none;margin-bottom:6px}a{color:var(--acc)}
+.chart{position:relative;margin-bottom:6px}.chart svg{display:block;width:100%;height:auto;touch-action:pan-y}
+.ct{font-size:12px;color:var(--mut);margin:8px 0 2px}.ct b{color:var(--fg);font-weight:600}
+#tip{position:absolute;pointer-events:none;background:#000c;border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:12px;display:none;white-space:nowrap;z-index:2}
+.odds{display:grid;grid-template-columns:1fr auto;gap:6px 12px;font-size:14px}.odds b{text-align:right;font-variant-numeric:tabular-nums}
 </style></head><body><main>
 <h1>&#9889; SparkMiner</h1>
 <div class="grid">
@@ -81,6 +86,17 @@ button.sec{background:#2c2c2c;color:var(--fg)}small{color:var(--mut)}.msg{color:
 <div class="tile wide"><span>Network hashrate / difficulty</span><b id="net" style="font-size:15px">-</b></div>
 </div>
 <p id="links"></p>
+
+<h2>Last 24 hours</h2><div class="card" id="hist" style="position:relative">
+<div id="tip"></div>
+<div class="ct">Hashrate, kH/s <b id="cv0"></b></div><div class="chart" id="c0"></div>
+<div class="ct">Chip temperature, &deg;C <b id="cv1"></b></div><div class="chart" id="c1"></div>
+<div class="ct">WiFi signal, dBm <b id="cv2"></b></div><div class="chart" id="c2"></div>
+<small id="hnote">Shaded = offline (WiFi or pool down). One point every 5 minutes.</small>
+</div>
+
+<h2>Odds of finding a block</h2><div class="card"><div class="odds" id="odds" style="padding-top:10px"><span>Waiting for network data...</span></div>
+<small style="display:block;margin-top:8px">A block needs one share above the network difficulty. Every hash is an independent draw, so past luck doesn't change future odds.</small></div>
 
 <div id="pinbar" class="card"><label>Admin PIN <small>(needed to change anything)</small></label><input id="pin" type="password" inputmode="numeric" autocomplete="current-password"></div>
 
@@ -103,6 +119,11 @@ button.sec{background:#2c2c2c;color:var(--fg)}small{color:var(--mut)}.msg{color:
 <small>0% turns the screen off. Tap the screen to light it up for a minute.</small>
 <label>Turn the screen off when not touched for</label><select name="scr_off"><option value="0">Never</option><option value="1">1 minute</option><option value="5">5 minutes</option><option value="15">15 minutes</option><option value="30">30 minutes</option><option value="60">1 hour</option></select>
 <small>Tap the screen or press BOOT to wake it (the first tap only wakes).</small>
+<label class="ck"><input type="checkbox" name="auto_br" value="1">Auto brightness from room light</label>
+<label class="ck"><input type="checkbox" name="dark_off" value="1">Screen off while the room is dark</label>
+<small>Light sensor now: <b id="lt">-</b> &middot; lit: <b id="lb">-</b> &middot; dark: <b id="ld">-</b></small>
+<div class="row" style="grid-template-columns:1fr 1fr"><button type="button" class="sec" id="lcb">Room is lit now</button><button type="button" class="sec" id="lcd">Room is dark now</button></div>
+<small>Calibrate once: press "lit" with the lights on, then "dark" with them off.</small>
 <label class="ck"><input type="checkbox" name="led" value="1">Status LED (red blink = no WiFi, blue blink = no pool, green flash = share)</label>
 <label class="ck"><input type="checkbox" name="https" value="1">Live BTC price &amp; network stats (HTTPS from the miner)</label>
 </div>
@@ -161,7 +182,7 @@ $('blk').textContent=s.blocks;$('up').textContent=up(s.uptime);$('ping').textCon
 $('pool').innerHTML='<span class="dot'+(s.pool_ok?' on':'')+'"></span>'+(s.pool||'-');
 $('rssi').textContent=s.rssi+' dBm';$('tmp').textContent=Math.round(s.temp)+' \u00b0C';$('wn').textContent=s.ssid||'-';$('heap').textContent=Math.round(s.heap/1024)+' KB';
 $('px').textContent=s.btc?'$'+Math.round(s.btc).toLocaleString():'-';$('bh').textContent=s.height||'-';
-$('ust').textContent='Update status: '+s.update;$('net').textContent=(s.net_hr||'-')+' / '+(s.net_diff||'-');$('host').textContent=s.host+' · '+s.ip+' · '+s.version;
+$('ust').textContent='Update status: '+s.update;odds(s);$('lt').textContent=s.light<0?'n/a':s.light;$('lb').textContent=s.light_bright||'-';$('ld').textContent=s.light_dark||'-';$('net').textContent=(s.net_hr||'-')+' / '+(s.net_diff||'-');$('host').textContent=s.host+' · '+s.ip+' · '+s.version;
 }).catch(function(){})}
 fetch('/api/config').then(function(r){return r.json()}).then(function(c){var f=$('f');
 $('au').checked=!!c.auto_up;for(var k in c){var e=f[k];if(!e)continue;if(e.type=='checkbox')e.checked=!!c[k];else e.value=c[k]}
@@ -171,7 +192,7 @@ a.href=pp?'https://web.public-pool.io/#/app/'+encodeURIComponent(c.wallet):'http
 a.textContent=pp?'Open pool stats ↗':'Open wallet on mempool.space ↗';a.target='_blank';$('links').appendChild(a)}});
 load();setInterval(load,5000);
 $('f').onsubmit=function(e){e.preventDefault();if(!confirm('Save settings and restart the miner?'))return;
-var fd=new FormData($('f'));['night','led','https','daily','auto_up'].forEach(function(n){if(!fd.has(n))fd.append(n,'0')});
+var fd=new FormData($('f'));['night','led','https','daily','auto_up','auto_br','dark_off'].forEach(function(n){if(!fd.has(n))fd.append(n,'0')});
 post('/api/save',new URLSearchParams(fd),'msg')};
 $('tn').onclick=function(){var b=new URLSearchParams();b.append('ntfy',$('f').ntfy.value);post('/api/test-notify',b,'msg')};
 function esc(t){var d=document.createElement('div');d.textContent=t;return d.innerHTML}
@@ -186,6 +207,48 @@ $('nl').innerHTML=l.map(function(n){return '<option value="'+esc(n.ssid)+'">'+n.
 say('msg3',l.length+' networks found - pick one in the name box')})};
 $('na').onclick=function(){var p=new URLSearchParams();p.append('ssid',$('ns').value);p.append('pass',$('np').value);
 post('/api/wifi/add',p,'msg3').then(function(ok){if(ok){$('np').value='';wifi()}})};
+// ---- 24 h charts: three small multiples on one time axis, synced crosshair
+var H=null;
+function chart(id,vals,fmt,i){var el=$(id),W=el.clientWidth||600,h=96,pl=34,pr=6,pt=6,pb=i==2?20:6;
+var t=H.t,n=t.length,t0=t[0],t1=t[n-1],sp=Math.max(1,t1-t0);var v=vals.filter(function(x){return x!=null});
+var lo=Math.min.apply(null,v),hi=Math.max.apply(null,v);if(hi-lo<1){hi+=1;lo-=1}var pad=(hi-lo)*.12;lo-=pad;hi+=pad;if(i==0){lo=0;hi=Math.max.apply(null,v)*1.15||1}
+function X(tt){return pl+(tt-t0)/sp*(W-pl-pr)}function Y(y){return pt+(hi-y)/(hi-lo)*(h-pt-pb)}
+var st=Math.pow(10,Math.floor(Math.log10((hi-lo)/3))),m=(hi-lo)/3/st;st*=m>5?10:m>2?5:m>1?2:1;var ticks=[];for(var tv=Math.ceil(lo/st)*st;tv<=hi;tv+=st)ticks.push(tv);
+var g='',k;for(k=0;k<ticks.length;k++){var gv=ticks[k];g+='<line x1="'+pl+'" x2="'+(W-pr)+'" y1="'+Y(gv)+'" y2="'+Y(gv)+'" stroke="#2c2c2c"/><text x="'+(pl-4)+'" y="'+(Y(gv)+4)+'" fill="#9a9a9a" font-size="10" text-anchor="end">'+Math.round(gv)+'</text>'}
+var off='';for(k=0;k<n;k++)if(!H.pool[k]||!H.rssi[k]){var x0=X(t[k]-H.interval/2),x1=X(t[k]+H.interval/2);off+='<rect x="'+x0+'" y="'+pt+'" width="'+Math.max(1,x1-x0)+'" height="'+(h-pt-pb)+'" fill="#ff505026"/>'}
+var d='',pen=false;for(k=0;k<n;k++){if(vals[k]==null||(k&&t[k]-t[k-1]>H.interval*2.5)){pen=false;if(vals[k]==null)continue}d+=(pen?'L':'M')+X(t[k]).toFixed(1)+' '+Y(vals[k]).toFixed(1);pen=true}
+var ax='';if(i==2){var hr=3600;for(var tt=Math.ceil(t0/(6*hr))*6*hr;tt<=t1;tt+=6*hr){var dt=new Date(tt*1000);ax+='<text x="'+X(tt)+'" y="'+(h-4)+'" fill="#9a9a9a" font-size="10" text-anchor="middle">'+('0'+dt.getHours()).slice(-2)+':00</text>'}}
+el.innerHTML='<svg viewBox="0 0 '+W+' '+h+'" width="'+W+'" height="'+h+'">'+off+g+'<path d="'+d+'" fill="none" stroke="#ff6800" stroke-width="2" stroke-linejoin="round"/>'+ax+'<line class="xh" y1="'+pt+'" y2="'+(h-pb)+'" stroke="#f2f2f2" stroke-width="1" visibility="hidden"/><circle class="dt" r="4" fill="#ff6800" stroke="#0d0d0d" stroke-width="2" visibility="hidden"/></svg>';
+el._X=X;el._Y=Y;el._v=vals}
+var SER=[{k:'hr',f:function(v){return v>=1000?(v/1000).toFixed(2)+' MH/s':Math.round(v)+' kH/s'}},{k:'temp',f:function(v){return Math.round(v)+' \u00b0C'}},{k:'rssi',f:function(v){return Math.round(v)+' dBm'}}];
+function drawHist(){if(!H)return;if(H.t.length<2){$('hnote').textContent='Collecting data - the first points appear within 10 minutes.';return}
+SER.forEach(function(s,i){var vals=H[s.k].map(function(v,j){return(s.k=='rssi'&&!H.rssi[j])||(s.k=='hr'&&!H.pool[j])?null:v});chart('c'+i,vals,s.f,i);
+var last=vals.filter(function(x){return x!=null});$('cv'+i).textContent=last.length?s.f(last[last.length-1]):''})}
+function hover(e){if(!H||H.t.length<2)return;var box=$('c0').getBoundingClientRect(),px=e.clientX-box.left,el0=$('c0');
+var W=box.width,pl=34,pr=6,t=H.t,f=(px-pl)/(W-pl-pr);if(f<0||f>1){hide();return}var tt=t[0]+f*(t[t.length-1]-t[0]),j=0;
+for(var k=1;k<t.length;k++)if(Math.abs(t[k]-tt)<Math.abs(t[j]-tt))j=k;var html=new Date(t[j]*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+SER.forEach(function(s,i){var el=$('c'+i),svg=el.querySelector('svg');if(!svg)return;var sc=svg.viewBox.baseVal.width/box.width,x=el._X(t[j]);
+var xh=svg.querySelector('.xh'),dt=svg.querySelector('.dt');xh.setAttribute('x1',x);xh.setAttribute('x2',x);xh.setAttribute('visibility','visible');
+var v=el._v[j];if(v!=null){dt.setAttribute('cx',x);dt.setAttribute('cy',el._Y(v));dt.setAttribute('visibility','visible')}else dt.setAttribute('visibility','hidden');
+html+='<br>'+['Hashrate','Temp','Signal'][i]+': '+(v==null?'offline':s.f(v))});
+var tip=$('tip'),hb=$('hist').getBoundingClientRect();tip.innerHTML=html;tip.style.display='block';
+var left=e.clientX-hb.left+12;if(left+130>hb.width)left=e.clientX-hb.left-140;tip.style.left=left+'px';tip.style.top=(e.clientY-hb.top+12)+'px'}
+function hide(){$('tip').style.display='none';Array.prototype.forEach.call(document.querySelectorAll('.xh,.dt'),function(n){n.setAttribute('visibility','hidden')})}
+['c0','c1','c2'].forEach(function(id){var el=$(id);el.addEventListener('pointermove',hover);el.addEventListener('pointerdown',hover);el.addEventListener('pointerleave',hide)});
+function loadHist(){fetch('/api/history').then(function(r){return r.json()}).then(function(h){H=h;drawHist()}).catch(function(){})}
+loadHist();setInterval(loadHist,300000);window.addEventListener('resize',drawHist);
+
+// ---- Odds (same maths as the miner's Odds screen)
+function big(v){var u=[[1e18,'quintillion'],[1e15,'quadrillion'],[1e12,'trillion'],[1e9,'billion'],[1e6,'million']];
+for(var i=0;i<u.length;i++)if(v>=u[i][0])return (v/u[i][0]).toFixed(v/u[i][0]<10?1:0)+' '+u[i][1];return Math.round(v).toLocaleString()}
+function odds(s){if(!s.net_diff_raw||!s.hashrate)return;var E=s.net_diff_raw*4294967296/s.hashrate,day=1-Math.exp(-86400/E),yr=1-Math.exp(-31557600/E);
+var rows=[['Expected wait','~'+big(E/31557600)+' years'],['Chance today','1 in '+big(1/day)],['Chance this year','1 in '+big(1/yr)],
+['Lottery 1st prize (1 in 1,000,000)',big(1e-6/yr)+'x more likely'],['Your best share',(+s.best).toPrecision(3)+' of '+big(s.net_diff_raw)+' needed'],
+['Work done so far',(s.hashes/(s.net_diff_raw*4294967296)*100).toExponential(1)+'% of one expected block']];
+$('odds').innerHTML=rows.map(function(r){return '<span>'+r[0]+'</span><b>'+r[1]+'</b>'}).join('')}
+
+$('lcb').onclick=function(){var p=new URLSearchParams();p.append('which','bright');post('/api/light-cal',p,'msg')};
+$('lcd').onclick=function(){var p=new URLSearchParams();p.append('which','dark');post('/api/light-cal',p,'msg')};
 $('cu').onclick=function(){post('/api/check-update','','msg2')};
 $('rb').onclick=function(){if(confirm('Restart the miner?'))post('/api/restart','','msg2')};
 $('wp').onclick=function(){if(confirm('Reboot into the WiFi setup hotspot? Mining pauses until it is set up or 5 minutes pass.'))post('/api/portal','','msg2')};
@@ -283,6 +346,10 @@ static void handleStatus() {
     j += ",\"reset_reason\":"; j += (int)esp_reset_reason();
     j += ",\"build\":";     j += (uint32_t)FW_BUILD;
     j += ",\"screen_on\":"; j += extras_is_dimmed() ? "false" : "true";
+    j += ",\"light\":";     j += extras_light();
+    j += ",\"light_bright\":"; j += extras_get()->lightBright;
+    j += ",\"light_dark\":"; j += extras_get()->lightDark;
+    j += ",\"net_diff_raw\":"; snprintf(buf, sizeof(buf), "%.6g", d->networkDifficultyRaw); j += buf;
     j += ",\"update\":";    jsonStr(j, fw_update_state());
     #ifdef HAVE_TOUCH_POSITION
         uint16_t th[4][2];
@@ -326,6 +393,8 @@ static void handleConfig() {
     j += ",\"daily\":";         j += x->notifyDaily ? 1 : 0;
     j += ",\"auto_up\":";       j += x->autoUpdate ? 1 : 0;
     j += ",\"scr_off\":";       j += x->screenOffMin;
+    j += ",\"auto_br\":";       j += x->autoBright ? 1 : 0;
+    j += ",\"dark_off\":";      j += x->darkOff ? 1 : 0;
     j += ",\"has_pin\":";       j += x->pin[0] ? "true" : "false";
     j += "}";
     s_server.send(200, "application/json", j);
@@ -389,6 +458,8 @@ static void handleSave() {
     if (s_server.hasArg("n_bright")) x->nightBright = constrain(s_server.arg("n_bright").toInt(), 0, 100);
     x->ledEnabled = argFlag("led", x->ledEnabled);
     x->autoUpdate = argFlag("auto_up", x->autoUpdate);
+    x->autoBright = argFlag("auto_br", x->autoBright);
+    x->darkOff = argFlag("dark_off", x->darkOff);
     if (s_server.hasArg("scr_off")) x->screenOffMin = constrain(s_server.arg("scr_off").toInt(), 0, 240);
     x->notifyDaily = argFlag("daily", x->notifyDaily);
     if (s_server.hasArg("ntfy")) strlcpy(x->ntfyTopic, topic.c_str(), sizeof(x->ntfyTopic));
@@ -480,6 +551,22 @@ static void handleWifiRemove() {
         return;
     }
     s_server.send(wifi_store_remove(ssid.c_str()) ? 200 : 404, "text/plain", "Removed.");
+}
+
+static void handleHistory() {
+    String j;
+    history_json(j);
+    s_server.send(200, "application/json", j);
+}
+
+static void handleLightCal() {
+    if (!requirePin()) return;
+    if (extras_light() < 0) { s_server.send(400, "text/plain", "No light sensor reading yet."); return; }
+    bool bright = s_server.arg("which") == "bright";
+    extras_light_calibrate(bright);
+    String msg = String(bright ? "Lit" : "Dark") + " level saved (" + extras_light() + ").";
+    if (extras_get()->lightBright == extras_get()->lightDark) msg += " Do the other one too.";
+    s_server.send(200, "text/plain", msg);
 }
 
 static void handleCheckUpdate() {
@@ -596,6 +683,8 @@ void web_ui_start() {
     s_server.on("/api/restart", HTTP_POST, handleRestart);
     s_server.on("/api/check-update", HTTP_POST, handleCheckUpdate);
     s_server.on("/api/wifi", HTTP_GET, handleWifiList);
+    s_server.on("/api/history", HTTP_GET, handleHistory);
+    s_server.on("/api/light-cal", HTTP_POST, handleLightCal);
     s_server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
     s_server.on("/api/wifi/add", HTTP_POST, handleWifiAdd);
     s_server.on("/api/wifi/remove", HTTP_POST, handleWifiRemove);
@@ -614,6 +703,7 @@ void web_ui_task(void *param) {
         if (!s_started) web_ui_start();   // No-op until WiFi is connected
         if (s_started) s_server.handleClient();
         if (s_restartAt && (int32_t)(millis() - s_restartAt) >= 0) {
+            history_save();
             if (s_portalAfter) extras_request_portal();  // reboots
             ESP.restart();
         }

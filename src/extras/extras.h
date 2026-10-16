@@ -23,6 +23,10 @@ typedef struct {
     bool ledEnabled;        // RGB status LED
     bool autoUpdate;        // Install signed releases from GitHub automatically
     uint8_t screenOffMin;   // Turn the backlight off after this many minutes without a tap (0 = never)
+    bool autoBright;        // Follow room light (light sensor), between 10 % and the set brightness
+    bool darkOff;           // Screen off while the room is dark
+    uint16_t lightBright;   // Sensor reading with the room lit   (calibrated from the web UI)
+    uint16_t lightDark;     // Sensor reading with the room dark  (calibrated from the web UI)
 } extras_config_t;
 
 void extras_init();
@@ -49,6 +53,12 @@ void extras_wake();
  * Any tap or button press: restarts the screen-off timer
  */
 void extras_activity();
+
+/**
+ * Smoothed light sensor reading (raw ADC), and calibration from the current value
+ */
+int extras_light();
+void extras_light_calibrate(bool roomIsBright);
 
 /**
  * Acknowledge the block-found LED celebration

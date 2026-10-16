@@ -16,6 +16,7 @@
 #include <board_config.h>
 #include "fw_update.h"
 #include "extras.h"
+#include "history.h"
 #include "../mining/miner.h"
 
 #ifdef UPDATE_REPO
@@ -201,6 +202,7 @@ static void checkNow() {
     char msg[96];
     snprintf(msg, sizeof(msg), "Installed %s (was %s). Restarting now.", tag, AUTO_VERSION);
     extras_notify("Miner updated", msg, "arrow_up", 2);
+    history_save();
     delay(500);
     ESP.restart();
 }

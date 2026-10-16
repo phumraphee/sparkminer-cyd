@@ -23,6 +23,7 @@
     #define HAVE_QR_SCREEN  1
     #define SCREEN_QR       4
     #define SCREEN_MARKET   5
+    #define SCREEN_ODDS     6
 #endif
 
 // ============================================================
@@ -707,6 +708,82 @@ static void drawClockScreen(const display_data_t *data) {
 }
 
 #ifdef HAVE_QR_SCREEN
+// "1 in 9.2 trillion" style numbers
+static String humanCount(double v) {
+    static const struct { double div; const char *name; } units[] = {
+        {1e18, "quintillion"}, {1e15, "quadrillion"}, {1e12, "trillion"}, {1e9, "billion"}, {1e6, "million"}};
+    for (auto &u : units) {
+        if (v >= u.div) return String(v / u.div, v / u.div < 10 ? 1 : 0) + " " + u.name;
+    }
+    if (v >= 1000) return String((long)v);
+    return String(v, v < 10 ? 1 : 0);
+}
+
+// Odds screen: what the lottery actually looks like at this hashrate
+static void drawOddsScreen(const display_data_t *data) {
+    int w = display_get_width();
+    int y = HEADER_HEIGHT + 8;
+    bool portrait = display_is_portrait();
+    double D = data->networkDifficultyRaw;
+    double h = data->hashRate;
+
+    s_tft.fillRoundRect(MARGIN - 4, y - 4, w - 2*MARGIN + 8, 56, 6, COLOR_PANEL);
+    s_tft.drawRoundRect(MARGIN - 4, y - 4, w - 2*MARGIN + 8, 56, 6, COLOR_ACCENT);
+    s_tft.setTextSize(1);
+    s_tft.setTextColor(COLOR_DIM, COLOR_PANEL);
+    s_tft.setCursor(MARGIN + 2, y + 2);
+    s_tft.print("Expected wait for a block");
+    s_tft.setTextSize(2);
+    s_tft.setTextColor(COLOR_ACCENT, COLOR_PANEL);
+    s_tft.setCursor(MARGIN + 2, y + 18);
+    if (D <= 0 || h <= 0) {
+        s_tft.setTextColor(COLOR_DIM, COLOR_PANEL);
+        s_tft.print("waiting for data");
+        drawBottomStatusBar(data);
+        return;
+    }
+    // Expected hashes per block = difficulty * 2^32
+    double expectSec = D * 4294967296.0 / h;
+    double years = expectSec / 31557600.0;
+    s_tft.print("~" + humanCount(years) + (portrait ? "" : " years") + "        ");
+    if (portrait) {
+        s_tft.setTextSize(1);
+        s_tft.setCursor(MARGIN + 2, y + 38);
+        s_tft.print("years (the universe is ~14 billion)");
+    }
+    y += 62;
+
+    double pDay = 1.0 - exp(-86400.0 / expectSec);
+    double pYear = 1.0 - exp(-31557600.0 / expectSec);
+    struct { const char *label; String value; uint16_t c; } rows[] = {
+        {"Chance today",     "1 in " + humanCount(1.0 / pDay),  COLOR_FG},
+        {"Chance this year", "1 in " + humanCount(1.0 / pYear), COLOR_FG},
+        {"vs lottery 1st prize", humanCount(1e-6 / pYear) + "x rarer", COLOR_SPARK1},
+        {"Your best share",  formatDifficulty(data->bestDifficulty) + " / " + String(data->networkDifficulty), COLOR_SPARK2},
+    };
+    int rowH = portrait ? 30 : 22;
+    for (auto &r : rows) {
+        s_tft.fillRoundRect(MARGIN - 4, y, w - 2*MARGIN + 8, rowH - 3, 4, COLOR_PANEL);
+        s_tft.setTextSize(1);
+        s_tft.setTextColor(COLOR_DIM, COLOR_PANEL);
+        s_tft.setCursor(MARGIN + 2, y + (portrait ? 3 : 7));
+        s_tft.print(r.label);
+        s_tft.setTextColor(r.c, COLOR_PANEL);
+        if (portrait) s_tft.setCursor(MARGIN + 2, y + 15);
+        else s_tft.setCursor(w / 2 - 10, y + 7);
+        s_tft.print(r.value + "   ");
+        y += rowH;
+    }
+    s_tft.setTextSize(1);
+    s_tft.setTextColor(COLOR_DIM, COLOR_BG);
+    s_tft.setCursor(MARGIN, y + 4);
+    s_tft.print("A block = best share above the difficulty");
+
+    drawBottomStatusBar(data);
+}
+#endif
+
+#ifdef HAVE_QR_SCREEN
 // Market screen: big BTC price, mempool fees, halving countdown
 static void drawMarketScreen(const display_data_t *data) {
     int w = display_get_width();
@@ -1093,6 +1170,9 @@ static void displayUpdateLocked(const display_data_t *data) {
         case SCREEN_MARKET:
             drawMarketScreen(data);
             break;
+        case SCREEN_ODDS:
+            drawOddsScreen(data);
+            break;
 #endif
         default:
             drawMiningScreen(data);
@@ -1122,7 +1202,7 @@ uint8_t display_get_screen() {
 
 // Screen cycle order
 #ifdef HAVE_QR_SCREEN
-static const uint8_t SCREEN_ORDER[] = {SCREEN_MINING, SCREEN_STATS, SCREEN_MARKET, SCREEN_CLOCK, SCREEN_QR};
+static const uint8_t SCREEN_ORDER[] = {SCREEN_MINING, SCREEN_STATS, SCREEN_MARKET, SCREEN_ODDS, SCREEN_CLOCK, SCREEN_QR};
 #else
 static const uint8_t SCREEN_ORDER[] = {SCREEN_MINING, SCREEN_STATS, SCREEN_CLOCK};
 #endif

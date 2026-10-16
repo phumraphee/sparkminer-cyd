@@ -62,6 +62,7 @@ struct display_data_s {
     int hourFee;
     int economyFee;
     bool poolStatsValid;        // Pool API answered for this wallet
+    double networkDifficultyRaw;
 };
 
 #if USE_DISPLAY

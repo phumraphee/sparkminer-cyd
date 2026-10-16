@@ -10,6 +10,7 @@
 #include <board_config.h>
 #include "extras.h"
 #include "fw_update.h"
+#include "history.h"
 #include "../config/wifi_store.h"
 #include "../config/wifi_manager.h"
 #include "../ui/wifi_ui.h"
@@ -29,6 +30,12 @@
 #define ROAM_RSSI_WEAK          -67                 // Only look for a better AP below this signal
 #define ROAM_RSSI_GAIN          8                   // ...and only move for at least this much improvement
 #define WAKE_MS                 60000               // Full brightness after a tap at night
+
+// CYD light sensor (LDR divider on an input-only ADC1 pin, fine alongside WiFi)
+#if defined(ESP32_2432S028)
+    #define HAVE_LIGHT_SENSOR 1
+    #define LIGHT_PIN 34
+#endif
 
 // CYD discrete RGB LED is wired active-low
 #if defined(ESP32_2432S028)
@@ -57,6 +64,10 @@ static void loadDefaults(extras_config_t *c) {
     c->ledEnabled = true;
     c->autoUpdate = true;
     c->screenOffMin = 0;
+    c->autoBright = false;
+    c->darkOff = false;
+    c->lightBright = 0;
+    c->lightDark = 0;
 }
 
 void extras_init() {
@@ -73,8 +84,18 @@ void extras_init() {
         s_cfg.ledEnabled   = p.getBool("led", s_cfg.ledEnabled);
         s_cfg.autoUpdate   = p.getBool("auto_up", s_cfg.autoUpdate);
         s_cfg.screenOffMin = p.getUChar("scr_off", s_cfg.screenOffMin);
+        s_cfg.autoBright   = p.getBool("auto_br", s_cfg.autoBright);
+        s_cfg.darkOff      = p.getBool("dark_off", s_cfg.darkOff);
+        s_cfg.lightBright  = p.getUShort("l_bright", s_cfg.lightBright);
+        s_cfg.lightDark    = p.getUShort("l_dark", s_cfg.lightDark);
         p.end();
     }
+
+    history_init();
+
+    #ifdef HAVE_LIGHT_SENSOR
+        analogSetPinAttenuation(LIGHT_PIN, ADC_0db);   // Most sensitive range for the CYD's LDR divider
+    #endif
 
     #ifdef HAVE_RGB_LED
         pinMode(LED_R_PIN, OUTPUT);
@@ -103,6 +124,10 @@ bool extras_save() {
     p.putBool("led", s_cfg.ledEnabled);
     p.putBool("auto_up", s_cfg.autoUpdate);
     p.putUChar("scr_off", s_cfg.screenOffMin);
+    p.putBool("auto_br", s_cfg.autoBright);
+    p.putBool("dark_off", s_cfg.darkOff);
+    p.putUShort("l_bright", s_cfg.lightBright);
+    p.putUShort("l_dark", s_cfg.lightDark);
     p.end();
     return true;
 }
@@ -149,6 +174,35 @@ bool extras_is_dimmed() {
     return s_dimmed;
 }
 
+static volatile float s_light = -1;   // EMA of the raw reading
+
+int extras_light() {
+    return s_light < 0 ? -1 : (int)(s_light + 0.5f);
+}
+
+void extras_light_calibrate(bool roomIsBright) {
+    if (s_light < 0) return;
+    if (roomIsBright) s_cfg.lightBright = extras_light();
+    else s_cfg.lightDark = extras_light();
+    extras_save();
+}
+
+static void lightSample() {
+    #ifdef HAVE_LIGHT_SENSOR
+        int sum = 0;
+        for (int i = 0; i < 8; i++) sum += analogRead(LIGHT_PIN);
+        float v = sum / 8.0f;
+        s_light = s_light < 0 ? v : s_light * 0.8f + v * 0.2f;
+    #endif
+}
+
+// 0..1 how lit the room is, from the two calibration points (-1 = not calibrated)
+static float roomLight() {
+    if (s_light < 0 || s_cfg.lightBright == s_cfg.lightDark) return -1;
+    float f = (s_light - s_cfg.lightDark) / ((float)s_cfg.lightBright - s_cfg.lightDark);
+    return f < 0 ? 0 : (f > 1 ? 1 : f);
+}
+
 void extras_activity() {
     s_lastActivity = millis();
 }
@@ -160,6 +214,7 @@ void extras_wake() {
         s_dimmed = false;
         display_set_brightness(nvs_config_get()->brightness);
     }
+    // (the next tick settles on the auto-brightness level if that is enabled)
 }
 
 void extras_ack_block() {
@@ -423,18 +478,29 @@ void extras_task(void *param) {
             }
 
             // Backlight: night level unless woken by a tap
-            // Backlight: off after the idle timeout, night level in the night window
-            // (a tap wakes it: until the next timeout by day, for a minute at night)
-            bool idleOff = s_cfg.screenOffMin && now - s_lastActivity > s_cfg.screenOffMin * 60000UL;
-            bool nightDim = night && (int32_t)(s_wakeUntil - now) <= 0;
-            bool wantDim = (idleOff || nightDim) && !blockParty;
-            uint8_t level = idleOff ? 0 : s_cfg.nightBright;
-            static uint8_t appliedLevel = 255;
-            if (wantDim != s_dimmed || (wantDim && level != appliedLevel)) {
-                s_dimmed = wantDim;
-                appliedLevel = wantDim ? level : 255;
-                display_set_brightness(wantDim ? level : config->brightness);
+            // Backlight level, most restrictive rule wins:
+            //   room light (auto)  -> 10 %..set brightness
+            //   dark room / night  -> off / night level   (a tap lights it for a minute)
+            //   idle timeout       -> off                 (a tap lights it until the next timeout)
+            lightSample();
+            bool woken = (int32_t)(s_wakeUntil - now) > 0;
+            float room = roomLight();
+            int level = config->brightness;
+            if (s_cfg.autoBright && room >= 0) level = 10 + (int)((config->brightness - 10) * room);
+            bool darkRoom = s_cfg.darkOff && room >= 0 && room < 0.15f;
+            bool scheduleDim = false;
+            if (darkRoom && !woken) { level = 0; scheduleDim = true; }
+            if (night && !woken && level > s_cfg.nightBright) { level = s_cfg.nightBright; scheduleDim = true; }
+            if (s_cfg.screenOffMin && now - s_lastActivity > s_cfg.screenOffMin * 60000UL) { level = 0; scheduleDim = true; }
+            if (blockParty) { level = config->brightness; scheduleDim = false; }
+            s_dimmed = scheduleDim;   // A tap on a dimmed screen only wakes it
+            static int applied = -1;
+            if (applied < 0 || abs(level - applied) >= 3 || (level == 0) != (applied == 0)) {
+                applied = level;
+                display_set_brightness(level);
             }
+
+            history_tick();
 
             // Signed self-update from GitHub Releases (on schedule or when asked)
             if (wifiUp) fw_update_poll(s_cfg.autoUpdate);
