@@ -53,6 +53,12 @@ void miner_sha_hold();
 void miner_sha_release();
 
 /**
+ * Pause the core-0 software miner (it never blocks, so long core-0 jobs like a
+ * firmware download would otherwise starve the idle task / task watchdog)
+ */
+void miner_core0_hold(bool hold);
+
+/**
  * Get current mining statistics
  */
 mining_stats_t* miner_get_stats();

@@ -50,6 +50,7 @@ static volatile bool s_core1Mining = false;
 static volatile int s_shaHoldCount = 0;
 static volatile bool s_core1Go = true;      // Polled by the assembly loop
 static volatile bool s_core1Parked = false;
+static volatile bool s_core0Hold = false;   // Firmware download: give core 0 back to the system
 static portMUX_TYPE s_shaHoldMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Current job
@@ -420,6 +421,10 @@ void miner_sha_hold() {
     }
 }
 
+void miner_core0_hold(bool hold) {
+    s_core0Hold = hold;
+}
+
 void miner_sha_release() {
     portENTER_CRITICAL(&s_shaHoldMux);
     if (s_shaHoldCount > 0) s_shaHoldCount--;
@@ -501,6 +506,7 @@ void miner_task_core0(void *param) {
             if (yieldCounter >= CORE_0_YIELD_COUNT) {
                 yieldCounter = 0;
                 vTaskDelay(1);  // Must use vTaskDelay(1), not taskYIELD()
+                while (s_core0Hold) vTaskDelay(pdMS_TO_TICKS(50));
             }
         }
 

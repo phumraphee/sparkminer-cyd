@@ -9,7 +9,6 @@
 #include <Update.h>
 #include <ArduinoJson.h>
 #include <esp_ota_ops.h>
-#include <esp_task_wdt.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/base64.h>
@@ -85,7 +84,74 @@ static bool verifySignature(uint32_t build, const uint8_t sha[32], const char *s
     return ok;
 }
 
-// Returns true only if it rebooted into... (never returns on success)
+// One download attempt straight into the spare OTA slot; true once activated
+static bool downloadAndInstall(const char *tag, const char *file, uint32_t size, const uint8_t expected[32]) {
+    setState("Downloading %s", tag);
+    WiFiClientSecure client;
+    HTTPClient http;
+    miner_sha_hold();
+    String url = String("https://raw.githubusercontent.com/" UPDATE_REPO "/ota/") + file;
+    if (!httpsGet(http, client, url) || http.getSize() != (int)size) {
+        http.end();
+        miner_sha_release();
+        setState("Download failed to start");
+        return false;
+    }
+    if (!Update.begin(size, U_FLASH)) {
+        http.end();
+        miner_sha_release();
+        setState("Update begin failed");
+        return false;
+    }
+
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts_ret(&ctx, 0);
+
+    WiFiClient *stream = http.getStreamPtr();
+    static uint8_t buf[1024];
+    uint32_t got = 0, lastPct = 0, lastData = millis();
+    while (got < size && millis() - lastData < 30000) {
+        size_t avail = stream->available();
+        if (!avail) {
+            if (!stream->connected()) break;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        int r = stream->readBytes(buf, min(avail, sizeof(buf)));
+        if (r <= 0) continue;
+        lastData = millis();
+        mbedtls_sha256_update_ret(&ctx, buf, r);
+        if (Update.write(buf, r) != (size_t)r) break;
+        got += r;
+        vTaskDelay(1);
+        uint32_t pct = got * 100 / size;
+        if (pct >= lastPct + 10) { lastPct = pct; setState("Downloading %s: %lu%%", tag, (unsigned long)pct); }
+    }
+    http.end();
+
+    uint8_t actual[32];
+    mbedtls_sha256_finish_ret(&ctx, actual);
+    mbedtls_sha256_free(&ctx);
+
+    if (got != size) {
+        Update.abort();
+        miner_sha_release();
+        setState("Download cut off at %lu%%", (unsigned long)(got * 100 / size));
+        return false;
+    }
+    if (memcmp(actual, expected, 32) != 0) {
+        Update.abort();
+        miner_sha_release();
+        setState("Download corrupt - discarded");
+        return false;
+    }
+    bool ok = Update.end(true);
+    miner_sha_release();
+    if (!ok) setState("Install failed: %s", Update.errorString());
+    return ok;
+}
+
 static void checkNow() {
     if (WiFi.status() != WL_CONNECTED) { setState("No WiFi"); return; }
 
@@ -141,62 +207,12 @@ static void checkNow() {
     }
 
     // --- Firmware download (miner parked: TLS + image hash use the SHA unit) ---
-    setState("Downloading %s", tag);
-    WiFiClientSecure client;
-    HTTPClient http;
-    miner_sha_hold();
-    String url = String("https://raw.githubusercontent.com/" UPDATE_REPO "/ota/") + file;
-    if (!httpsGet(http, client, url) || http.getSize() != (int)size) {
-        http.end();
-        miner_sha_release();
-        setState("Download failed");
-        return;
+    bool installed = false;
+    for (int attempt = 1; attempt <= 3 && !installed; attempt++) {
+        if (attempt > 1) { setState("Retrying download (%d/3)", attempt); vTaskDelay(pdMS_TO_TICKS(5000)); }
+        installed = downloadAndInstall(tag, file, size, expected);
     }
-    if (!Update.begin(size, U_FLASH)) {
-        http.end();
-        miner_sha_release();
-        setState("Update begin failed");
-        return;
-    }
-
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts_ret(&ctx, 0);
-
-    WiFiClient *stream = http.getStreamPtr();
-    static uint8_t buf[1024];
-    uint32_t got = 0, lastPct = 0, lastData = millis();
-    while (got < size && millis() - lastData < 20000) {
-        size_t avail = stream->available();
-        if (!avail) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
-        int r = stream->readBytes(buf, min(avail, sizeof(buf)));
-        if (r <= 0) continue;
-        lastData = millis();
-        mbedtls_sha256_update_ret(&ctx, buf, r);
-        if (Update.write(buf, r) != (size_t)r) break;
-        got += r;
-        vTaskDelay(1);  // Let the rest of core 0 breathe between chunks
-        uint32_t pct = got * 100 / size;
-        if (pct >= lastPct + 10) { lastPct = pct; setState("Downloading %s: %lu%%", tag, (unsigned long)pct); }
-    }
-    http.end();
-
-    uint8_t actual[32];
-    mbedtls_sha256_finish_ret(&ctx, actual);
-    mbedtls_sha256_free(&ctx);
-
-    if (got != size || memcmp(actual, expected, 32) != 0) {
-        Update.abort();
-        miner_sha_release();
-        setState("Download corrupt - discarded");
-        return;
-    }
-    bool ok = Update.end(true);
-    miner_sha_release();
-    if (!ok) {
-        setState("Install failed: %s", Update.errorString());
-        return;
-    }
+    if (!installed) return;
 
     setState("Installed %s - restarting", tag);
     char msg[96];
@@ -211,13 +227,11 @@ static volatile bool s_running = false;
 
 // TLS + JSON + ECDSA verification need far more stack than the extras task has
 static void updateTask(void *param) {
-    // The core-0 miner and this task share priority 1 and never block together
-    // during a download, so IDLE0 can't feed the task watchdog for 30 s+.
-    // Unwatch it for the duration of the check.
-    TaskHandle_t idle0 = xTaskGetIdleTaskHandleForCPU(0);
-    bool unwatched = esp_task_wdt_delete(idle0) == ESP_OK;
+    // The core-0 miner never blocks; with it and this task both busy at priority 1,
+    // IDLE0 can't feed the task watchdog during a download. Pause it meanwhile.
+    miner_core0_hold(true);
     checkNow();             // Reboots on success
-    if (unwatched) esp_task_wdt_add(idle0);
+    miner_core0_hold(false);
     s_running = false;
     vTaskDelete(NULL);
 }
