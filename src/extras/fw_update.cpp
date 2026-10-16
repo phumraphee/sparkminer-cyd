@@ -47,7 +47,7 @@ static uint32_t s_badBuild = 0;           // A build that was rolled back - neve
 static volatile bool s_requested = false;
 static uint32_t s_lastCheck = 0;
 static bool s_checkedOnce = false;
-static char s_state[64] = "Not checked yet";
+static char s_state[128] = "Not checked yet";
 
 static void setState(const char *fmt, ...) {
     va_list ap;
@@ -101,7 +101,13 @@ static bool verifySignature(uint32_t build, const uint8_t sha[32], const char *s
 // Download straight into the spare OTA slot, resuming with HTTP Range after a drop
 // (keeps one Update session and one running hash); true once activated
 static bool downloadAndInstall(const char *tag, const char *file, uint32_t size, const uint8_t expected[32]) {
-    String url = String("https://raw.githubusercontent.com/" UPDATE_REPO "/ota/") + file;
+    // Same file from two CDNs; the signature check makes the source irrelevant to safety
+    String urls[2] = {
+        String("https://raw.githubusercontent.com/" UPDATE_REPO "/ota/") + file,
+        String("https://cdn.jsdelivr.net/gh/" UPDATE_REPO "@ota/") + file,
+    };
+    int src = 0, failsOnSrc = 0;
+    char why[64] = "";
     miner_sha_hold();
     if (!Update.begin(size, U_FLASH)) {
         miner_sha_release();
@@ -119,20 +125,32 @@ static bool downloadAndInstall(const char *tag, const char *file, uint32_t size,
     int lastCode = 0;
     for (int conn = 0; conn < 15 && got < size && !writeFailed; conn++) {
         if (conn) {
-            setState("Connection dropped at %lu%% (HTTP %d) - resuming", (unsigned long)(got * 100 / size), lastCode);
+            // Two failed connects in a row on one CDN: try the other
+            if (++failsOnSrc >= 2) { src ^= 1; failsOnSrc = 0; }
+            setState("Dropped at %lu%% (%d %s) - retrying via %s", (unsigned long)(got * 100 / size), lastCode, why,
+                     src ? "jsDelivr" : "GitHub");
             vTaskDelay(pdMS_TO_TICKS(2000 + conn * 1000));
         }
+        uint32_t gotAtStart = got;
         WiFiClientSecure client;
         HTTPClient http;
         client.setInsecure();
         client.setTimeout(15000);
         http.setTimeout(15000);
         http.setUserAgent("SparkMiner-CYD");
-        if (!http.begin(client, url)) continue;
+        if (!http.begin(client, urls[src])) continue;
         if (got) http.addHeader("Range", String("bytes=") + got + "-");
         int code = http.GET();
         lastCode = code;
-        if (code != (got ? 206 : 200)) { http.end(); continue; }
+        if (code != (got ? 206 : 200)) {
+            // Record why (TLS error text, or free memory if the handshake ran out)
+            char tls[48] = "";
+            client.lastError(tls, sizeof(tls));
+            if (tls[0]) snprintf(why, sizeof(why), "%.40s", tls);
+            else snprintf(why, sizeof(why), "heap %u/%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+            http.end();
+            continue;
+        }
 
         WiFiClient *stream = http.getStreamPtr();
         uint32_t lastData = millis();
@@ -154,6 +172,7 @@ static bool downloadAndInstall(const char *tag, const char *file, uint32_t size,
             if (pct >= lastPct + 10) { lastPct = pct; setState("Downloading %s: %lu%%", tag, (unsigned long)pct); }
         }
         http.end();
+        if (got > gotAtStart) failsOnSrc = 0;   // That CDN delivered data: stay on it
     }
 
     uint8_t actual[32];
@@ -164,7 +183,7 @@ static bool downloadAndInstall(const char *tag, const char *file, uint32_t size,
         Update.abort();
         miner_sha_release();
         if (writeFailed) setState("Flash write failed: %s", Update.errorString());
-        else setState("Download failed at %lu%%", (unsigned long)(got * 100 / size));
+        else setState("Download failed at %lu%% (%d %s)", (unsigned long)(got * 100 / size), lastCode, why);
         return false;
     }
     if (memcmp(actual, expected, 32) != 0) {
