@@ -321,24 +321,28 @@ static int keyH() { return (H - headerH() - 42) / 4; }
 
 static void commitPending() { s_pendKey = -1; }
 
-static void drawKeypad(bool full) {
-    if (full) tft->fillScreen(C_BG);
-    char name[40];
-    fit(name, s_items[s_sel].ssid, (W - 40) / 6);
-    tft->fillRect(0, 0, W, headerH(), C_PANEL);
-    tft->setTextDatum(TL_DATUM);
-    tft->setTextSize(1);
-    tft->setTextColor(C_DIM, C_PANEL);
-    tft->drawString("Password for", 6, 4);
-    tft->setTextColor(C_FG, C_PANEL);
-    tft->drawString(name, 6, 14);
-    tft->setTextDatum(TR_DATUM);
-    tft->setTextColor(C_ACCENT, C_PANEL);
-    tft->drawString(s_mode == M_LOWER ? "abc" : s_mode == M_UPPER ? "ABC" : "123", W - 6, 4);
+// Off-screen buffers so keypad updates replace pixels in one push (no clear-then-draw flash)
+static TFT_eSprite *s_fieldSpr = nullptr, *s_keySpr = nullptr;
+static int s_drawnPend = -2, s_drawnMode = -1, s_drawnShow = -1;
 
-    // Password field: masked except the letter being typed (or all with the eye)
+static void freeSprites() {
+    if (s_fieldSpr) { s_fieldSpr->deleteSprite(); delete s_fieldSpr; s_fieldSpr = nullptr; }
+    if (s_keySpr) { s_keySpr->deleteSprite(); delete s_keySpr; s_keySpr = nullptr; }
+}
+
+static void ensureSprites(int kw, int kh) {
+    if (!s_fieldSpr) {
+        s_fieldSpr = new TFT_eSprite(tft);
+        if (!s_fieldSpr->createSprite(W - 8, 26)) { delete s_fieldSpr; s_fieldSpr = nullptr; }
+    }
+    if (!s_keySpr) {
+        s_keySpr = new TFT_eSprite(tft);
+        if (!s_keySpr->createSprite(kw, kh)) { delete s_keySpr; s_keySpr = nullptr; }
+    }
+}
+
+static void drawField() {
     int fy = headerH() - 30;
-    tft->fillRoundRect(4, fy, W - 8, 26, 4, C_BG);
     int len = strlen(s_pass);
     int maxShow = (W - 20) / 12;
     char shown[MAX_PASS + 1];
@@ -348,50 +352,105 @@ static void drawKeypad(bool full) {
     }
     shown[len] = '\0';
     const char *view = len > maxShow ? shown + (len - maxShow) : shown;
-    tft->setTextDatum(ML_DATUM);
-    tft->setTextSize(2);
-    tft->setTextColor(C_FG, C_BG);
-    tft->drawString(view, 10, fy + 13);
-    // Cursor
-    int cx = 10 + strlen(view) * 12;
-    tft->fillRect(cx, fy + 5, 2, 16, s_pendKey >= 0 ? C_ACCENT : C_FG);
-
-    // 3x4 keys
-    int kw = W / 3, kh = keyH(), y0 = headerH() + 2;
-    static const char *labels[12] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"};
-    for (int i = 0; i < 12; i++) {
-        int x = (i % 3) * kw, y = y0 + (i / 3) * kh;
-        int key = i < 9 ? i : (i == 10 ? 9 : -1);
-        bool pend = key >= 0 && key == s_pendKey;
-        uint16_t fill = pend ? 0x7A00 : C_KEY;
-        tft->fillRoundRect(x + 2, y + 2, kw - 4, kh - 4, 6, fill);
-        tft->setTextDatum(MC_DATUM);
+    int cx = 6 + strlen(view) * 12;
+    uint16_t cursor = s_pendKey >= 0 ? C_ACCENT : C_FG;
+    if (s_fieldSpr) {
+        TFT_eSprite &f = *s_fieldSpr;
+        f.fillSprite(C_PANEL);
+        f.fillRoundRect(0, 0, W - 8, 26, 4, C_BG);
+        f.setTextDatum(ML_DATUM);
+        f.setTextSize(2);
+        f.setTextColor(C_FG, C_BG);
+        f.drawString(view, 6, 13);
+        f.fillRect(cx, 5, 2, 16, cursor);
+        f.pushSprite(4, fy);
+    } else {   // Not enough RAM for the buffer: draw directly
+        tft->fillRoundRect(4, fy, W - 8, 26, 4, C_BG);
+        tft->setTextDatum(ML_DATUM);
         tft->setTextSize(2);
-        tft->setTextColor(C_FG, fill);
-        tft->drawString(labels[i], x + kw / 2, y + kh / 2 - (kh > 44 ? 8 : 6));
-        const char *sub;
-        if (i == 9) sub = "aA1";
-        else if (i == 11) sub = "sym";
-        else if (s_mode == M_DIGITS) sub = "";
-        else {
-            static char tmp[10];
-            const char *src = (s_mode == M_UPPER ? KEYS_UPPER : KEYS_LOWER)[key];
-            strlcpy(tmp, src, sizeof(tmp));
-            if (key == 9) strcpy(tmp, "0 space");
-            sub = tmp;
-        }
+        tft->setTextColor(C_FG, C_BG);
+        tft->drawString(view, 10, fy + 13);
+        tft->fillRect(cx + 4, fy + 5, 2, 16, cursor);
+    }
+}
+
+static void drawKey(int i) {
+    static const char *labels[12] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"};
+    int kw = W / 3, kh = keyH(), y0 = headerH() + 2;
+    int x = (i % 3) * kw, y = y0 + (i / 3) * kh;
+    int key = i < 9 ? i : (i == 10 ? 9 : -1);
+    bool pend = key >= 0 && key == s_pendKey;
+    uint16_t fill = pend ? 0x7A00 : C_KEY;
+    const char *sub;
+    static char tmp[10];
+    if (i == 9) sub = "aA1";
+    else if (i == 11) sub = "sym";
+    else if (s_mode == M_DIGITS) sub = "";
+    else {
+        strlcpy(tmp, (s_mode == M_UPPER ? KEYS_UPPER : KEYS_LOWER)[key], sizeof(tmp));
+        if (key == 9) strcpy(tmp, "0 space");
+        sub = tmp;
+    }
+    TFT_eSPI *g = s_keySpr ? (TFT_eSPI *)s_keySpr : tft;
+    int ox = s_keySpr ? 0 : x, oy = s_keySpr ? 0 : y;
+    if (s_keySpr) s_keySpr->fillSprite(C_BG);
+    g->fillRoundRect(ox + 2, oy + 2, kw - 4, kh - 4, 6, fill);
+    g->setTextDatum(MC_DATUM);
+    g->setTextSize(2);
+    g->setTextColor(C_FG, fill);
+    g->drawString(labels[i], ox + kw / 2, oy + kh / 2 - (kh > 44 ? 8 : 6));
+    g->setTextSize(1);
+    g->setTextColor(C_DIM, fill);
+    g->drawString(sub, ox + kw / 2, oy + kh / 2 + (kh > 44 ? 12 : 9));
+    if (s_keySpr) s_keySpr->pushSprite(x, y);
+}
+
+static int keyIndexFor(int key) { return key < 0 ? -1 : (key < 9 ? key : 10); }
+
+static void drawKeypad(bool full) {
+    int kw = W / 3, kh = keyH();
+    ensureSprites(kw, kh);
+    if (full) {
+        tft->fillScreen(C_BG);
+        char name[40];
+        fit(name, s_items[s_sel].ssid, (W - 40) / 6);
+        tft->fillRect(0, 0, W, headerH(), C_PANEL);
+        tft->setTextDatum(TL_DATUM);
         tft->setTextSize(1);
-        tft->setTextColor(C_DIM, fill);
-        tft->drawString(sub, x + kw / 2, y + kh / 2 + (kh > 44 ? 12 : 9));
+        tft->setTextColor(C_DIM, C_PANEL);
+        tft->drawString("Password for", 6, 4);
+        tft->setTextColor(C_FG, C_PANEL);
+        tft->drawString(name, 6, 14);
+        int ay = H - 40, aw = W / 4;
+        button(0, ay, aw, 40, "<-", C_KEY, C_FG);
+        button(2 * aw, ay, aw, 40, "Cancel", C_KEY, C_ACCENT, 1);
+        button(3 * aw, ay, W - 3 * aw, 40, "Join", 0x0320, C_FG);
+        s_drawnPend = -2; s_drawnMode = -1; s_drawnShow = -1;
     }
 
-    // Actions (only the eye label changes)
-    int ay = H - 40, aw = W / 4;
-    if (!full) { button(aw, ay, aw, 40, s_showPass ? "hide" : "show", C_KEY, C_FG, 1); return; }
-    button(0, ay, aw, 40, "<-", C_KEY, C_FG);
-    button(aw, ay, aw, 40, s_showPass ? "hide" : "show", C_KEY, C_FG, 1);
-    button(2 * aw, ay, aw, 40, "Cancel", C_KEY, C_ACCENT, 1);
-    button(3 * aw, ay, W - 3 * aw, 40, "Join", 0x0320, C_FG);
+    drawField();
+
+    if (s_mode != s_drawnMode) {
+        // Mode label + every key's letters change
+        tft->setTextDatum(TR_DATUM);
+        tft->setTextSize(1);
+        tft->setTextColor(C_ACCENT, C_PANEL);
+        tft->drawString(s_mode == M_LOWER ? "abc" : s_mode == M_UPPER ? "ABC" : "123", W - 6, 4);
+        for (int i = 0; i < 12; i++) drawKey(i);
+        s_drawnMode = s_mode;
+    } else if (s_pendKey != s_drawnPend) {
+        // Only the keys whose highlight changed
+        int was = keyIndexFor(s_drawnPend), now = keyIndexFor(s_pendKey);
+        if (was >= 0) drawKey(was);
+        if (now >= 0 && now != was) drawKey(now);
+    }
+    s_drawnPend = s_pendKey;
+
+    if (s_showPass != s_drawnShow) {
+        int aw = W / 4;
+        button(aw, H - 40, aw, 40, s_showPass ? "hide" : "show", C_KEY, C_FG, 1);
+        s_drawnShow = s_showPass;
+    }
 }
 
 static void pressKey(int key) {
@@ -484,6 +543,7 @@ static void message(const char *line1, const char *line2, uint16_t color) {
 }
 
 static void connectTo(const char *ssid, const char *pass) {
+    freeSprites();
     char name[40];
     fit(name, ssid, W / 12);
     message("Connecting...", name, C_ACCENT);
@@ -599,6 +659,7 @@ static void uiTask(void *param) {
     }
 
     // Hand the screen back
+    freeSprites();
     memset(s_pass, 0, sizeof(s_pass));
     display_take(false);
     vTaskDelete(NULL);
