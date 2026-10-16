@@ -8,6 +8,7 @@
 #include <board_config.h>
 #include "wifi_manager.h"
 #include "../extras/extras.h"
+#include "wifi_store.h"
 #include "nvs_config.h"
 #include "../stratum/stratum.h"
 #include "../display/display.h"
@@ -151,7 +152,7 @@ static void configModeCallback(WiFiManager *wm) {
     #if USE_DISPLAY
         display_show_ap_config(
             wm->getConfigPortalSSID().c_str(),
-            AP_PASSWORD,
+            extras_ap_password(),
             WiFi.softAPIP().toString().c_str()
         );
     #endif
@@ -423,7 +424,7 @@ void wifi_manager_blocking() {
     Serial.printf("[WIFI] Connect to AP '%s' to configure\n", apSSID);
 
     // Try to connect, fall back to AP if needed
-    bool connected = s_wm.autoConnect(apSSID, AP_PASSWORD);
+    bool connected = s_wm.autoConnect(apSSID, extras_ap_password());
 
     if (connected) {
         Serial.println("[WIFI] Connected!");
@@ -441,6 +442,7 @@ void wifi_manager_blocking() {
         configTime(gmtOffset, 0, "pool.ntp.org", "time.nist.gov");
         Serial.printf("[NTP] Time sync started (UTC%+d)\n", config->timezoneOffset);
 
+        wifi_store_put(config->ssid, config->wifiPassword);
         Serial.printf("[WIFI] Saving credentials for SSID: %s\n", config->ssid);
         if (nvs_config_save(config)) {
             Serial.println("[WIFI] Configuration saved to NVS successfully");
@@ -474,7 +476,7 @@ void wifi_manager_portal() {
 
     Serial.printf("[WIFI] Setup hotspot requested - connect to '%s' (5 min)\n", apSSID);
     s_wm.setConfigPortalTimeout(300);
-    bool connected = s_wm.startConfigPortal(apSSID, AP_PASSWORD);
+    bool connected = s_wm.startConfigPortal(apSSID, extras_ap_password());
 
     if (connected) {
         miner_config_t *config = nvs_config_get();
@@ -483,6 +485,7 @@ void wifi_manager_portal() {
         strncpy(config->wifiPassword, WiFi.psk().c_str(), MAX_PASSWORD_LEN);
         config->wifiPassword[MAX_PASSWORD_LEN] = '\0';
         nvs_config_save(config);
+        wifi_store_put(config->ssid, config->wifiPassword);
         Serial.printf("[WIFI] New WiFi saved: %s\n", config->ssid);
     } else {
         Serial.println("[WIFI] Setup hotspot closed without changes");
@@ -493,65 +496,134 @@ void wifi_manager_portal() {
     ESP.restart();
 }
 
+// Join one network and wait for an IP
+bool wifi_manager_connect(const char *ssid, const char *pass, uint32_t timeoutMs,
+                          int32_t channel, const uint8_t *bssid) {
+    Serial.printf("[WIFI] Connecting to %s...\n", ssid);
+    WiFi.disconnect(false);
+    delay(50);
+    WiFi.begin(ssid, pass, channel, bssid);
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+        delay(100);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.printf("[WIFI] Could not join %s\n", ssid);
+        return false;
+    }
+    Serial.printf("[WIFI] Connected to %s (%d dBm), IP %s\n", ssid, WiFi.RSSI(),
+                  WiFi.localIP().toString().c_str());
+    // Remember it as the current network (keeps the legacy config fields meaningful)
+    miner_config_t *config = nvs_config_get();
+    if (strcmp(config->ssid, ssid) != 0 || strcmp(config->wifiPassword, pass) != 0) {
+        strlcpy(config->ssid, ssid, sizeof(config->ssid));
+        strlcpy(config->wifiPassword, pass, sizeof(config->wifiPassword));
+        nvs_config_save(config);
+    }
+    return true;
+}
+
+// Scan, then try every saved network in range, strongest first
+bool wifi_manager_connect_best(uint32_t perTryMs) {
+    if (wifi_store_count() == 0) return false;
+    WiFi.mode(WIFI_STA);
+    int n = WiFi.scanNetworks(false, true);
+    if (n <= 0) {
+        WiFi.scanDelete();
+        Serial.println("[WIFI] Scan found no networks");
+        return false;
+    }
+
+    struct Cand { int idx; int rssi; };
+    Cand cands[16];
+    int nc = 0;
+    for (int i = 0; i < n && nc < 16; i++) {
+        if (!wifi_store_find(WiFi.SSID(i).c_str())) continue;
+        // Keep only the strongest access point per SSID
+        bool dup = false;
+        for (int j = 0; j < nc; j++) {
+            if (WiFi.SSID(cands[j].idx) == WiFi.SSID(i)) {
+                dup = true;
+                if (WiFi.RSSI(i) > cands[j].rssi) { cands[j].idx = i; cands[j].rssi = WiFi.RSSI(i); }
+            }
+        }
+        if (!dup) cands[nc++] = {i, WiFi.RSSI(i)};
+    }
+    // Strongest first
+    for (int i = 1; i < nc; i++) {
+        Cand c = cands[i];
+        int j = i - 1;
+        while (j >= 0 && cands[j].rssi < c.rssi) { cands[j + 1] = cands[j]; j--; }
+        cands[j + 1] = c;
+    }
+
+    struct Try { char ssid[33]; char pass[65]; int32_t ch; uint8_t bssid[6]; };
+    static Try tries[16];
+    for (int i = 0; i < nc; i++) {
+        const wifi_entry_t *e = wifi_store_find(WiFi.SSID(cands[i].idx).c_str());
+        strlcpy(tries[i].ssid, e->ssid, sizeof(tries[i].ssid));
+        strlcpy(tries[i].pass, e->pass, sizeof(tries[i].pass));
+        tries[i].ch = WiFi.channel(cands[i].idx);
+        memcpy(tries[i].bssid, WiFi.BSSID(cands[i].idx), 6);
+        Serial.printf("[WIFI] In range: %s (%d dBm)\n", tries[i].ssid, cands[i].rssi);
+    }
+    WiFi.scanDelete();
+    if (nc == 0) Serial.println("[WIFI] No saved network in range");
+
+    for (int i = 0; i < nc; i++) {
+        if (wifi_manager_connect(tries[i].ssid, tries[i].pass, perTryMs, tries[i].ch, tries[i].bssid)) return true;
+    }
+    return false;
+}
+
+// Strongest saved network in range; if the scan route fails for any reason,
+// fall back to joining the last-used network directly (the pre-list behaviour)
+bool wifi_manager_reconnect() {
+    if (wifi_manager_connect_best(10000)) return true;
+    miner_config_t *config = nvs_config_get();
+    if (config->ssid[0]) {
+        WiFi.disconnect(false);
+        delay(50);
+        WiFi.begin(config->ssid, config->wifiPassword);
+        uint32_t start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) delay(100);
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("[WIFI] Joined %s directly\n", config->ssid);
+            return true;
+        }
+    }
+    return false;
+}
+
 void wifi_manager_start() {
     if (!s_initialized) {
         wifi_manager_init();
     }
 
     miner_config_t *config = nvs_config_get();
+    wifi_store_init();
 
-    // Check if we have valid configuration (SD card with stats doesn't count as config)
-    bool hasWifiConfig = (config->ssid[0] != '\0');
-    bool hasPoolConfig = (config->wallet[0] != '\0');
+    // NTP syncs whenever a network comes up
+    configTime(config->timezoneOffset * 3600L, 0, "pool.ntp.org", "time.nist.gov");
 
-    if (!hasWifiConfig && !hasPoolConfig) {
-        // No config at all - go directly to captive portal
-        Serial.println("[WIFI] No configuration found (SD stats don't count as config)");
-        Serial.println("[WIFI] Entering WiFi configuration mode...");
+    // Nothing configured at all: first-time setup through the hotspot
+    if (wifi_store_count() == 0 && config->wallet[0] == '\0') {
+        Serial.println("[WIFI] No configuration found - starting setup hotspot");
         wifi_manager_blocking();
         return;
     }
 
-    // Several access points can share one SSID: scan every channel and join
-    // the strongest instead of the first one found
-    WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
-    WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
-
-    // Setup hotspot explicitly requested (long touch / web UI) - keeps other settings
+    // Setup hotspot explicitly requested (WiFi menu / web UI) - keeps other settings
     if (extras_take_portal_flag()) {
         wifi_manager_portal();
         return;
     }
 
-    // If we have stored credentials, try to connect directly
-    if (config->ssid[0] != '\0') {
-        Serial.printf("[WIFI] Connecting to %s...\n", config->ssid);
-        WiFi.begin(config->ssid, config->wifiPassword);
+    if (wifi_manager_reconnect()) return;
 
-        // Wait up to 10 seconds
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-            delay(500);
-            Serial.print(".");
-            attempts++;
-        }
-        Serial.println();
-
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-            strncpy(s_ipAddress, WiFi.localIP().toString().c_str(), sizeof(s_ipAddress));
-            
-            // Configure NTP
-            long gmtOffset = config->timezoneOffset * 3600L;
-            configTime(gmtOffset, 0, "pool.ntp.org", "time.nist.gov");
-            Serial.printf("[NTP] Time sync started (UTC%+d)\n", config->timezoneOffset);
-            
-            return;
-        }
-    }
-
-    // Fall back to blocking mode with portal
-    wifi_manager_blocking();
+    // No saved network in range: keep running offline. The extras task rescans
+    // every minute, and the WiFi menu (hold the screen 3 s) can add a network.
+    Serial.println("[WIFI] Offline - will keep looking for saved networks");
 }
 
 void wifi_manager_process() {
@@ -579,5 +651,11 @@ void wifi_manager_reset() {
 }
 
 const char* wifi_manager_get_ip() {
+    // Live value: the network can change at any time now
+    if (WiFi.status() == WL_CONNECTED) {
+        strlcpy(s_ipAddress, WiFi.localIP().toString().c_str(), sizeof(s_ipAddress));
+    } else {
+        strlcpy(s_ipAddress, "0.0.0.0", sizeof(s_ipAddress));
+    }
     return s_ipAddress;
 }

@@ -12,9 +12,11 @@
 #define T_MISO  39
 #define T_CS    33
 
-// Raw range of the panel (typical CYD values)
-#define RAW_MIN 200
-#define RAW_MAX 3800
+// Raw range per axis, from the corner taps below (edges slightly padded)
+#define RAW_X_MIN 600
+#define RAW_X_MAX 3650
+#define RAW_Y_MIN 350
+#define RAW_Y_MAX 3800
 
 // Portrait (rotation 0) calibration from corner taps on the real board:
 // TL [3480,402]  TR [648,433]  BL [3611,3750]  BR [658,3692]
@@ -93,24 +95,32 @@ void touch_history(uint16_t out[4][2]) {
     }
 }
 
-static float norm(uint16_t v) {
-    float f = (float)((int)v - RAW_MIN) / (RAW_MAX - RAW_MIN);
+static float norm(uint16_t v, int lo, int hi) {
+    float f = (float)((int)v - lo) / (hi - lo);
     return f < 0 ? 0 : (f > 1 ? 1 : f);
 }
 
-float touch_screen_x(uint16_t rawX, uint16_t rawY, uint8_t rotation) {
-    float nx = norm(rawX), ny = norm(rawY);
+// Rotation mapping follows TFT_eSPI's ILI9341 MADCTL table:
+// r0 MX, r1 MV, r2 MY, r3 MX|MY|MV (see TFT_Drivers/ILI9341_Rotation.h)
+void touch_screen_xy(uint16_t rawX, uint16_t rawY, uint8_t rotation, float *sx, float *sy) {
+    float nx = norm(rawX, RAW_X_MIN, RAW_X_MAX), ny = norm(rawY, RAW_Y_MIN, RAW_Y_MAX);
     // Panel coordinates in its native portrait orientation (0..1)
     float px = CAL_SWAP_XY ? ny : nx;
     float py = CAL_SWAP_XY ? nx : ny;
     if (CAL_INVERT_X) px = 1 - px;
     if (CAL_INVERT_Y) py = 1 - py;
     switch (rotation & 3) {
-        case 0:  return px;
-        case 1:  return py;
-        case 2:  return 1 - px;
-        default: return 1 - py;
+        case 0:  *sx = px;     *sy = py;     break;
+        case 1:  *sx = py;     *sy = 1 - px; break;
+        case 2:  *sx = 1 - px; *sy = 1 - py; break;
+        default: *sx = 1 - py; *sy = px;     break;
     }
+}
+
+float touch_screen_x(uint16_t rawX, uint16_t rawY, uint8_t rotation) {
+    float sx, sy;
+    touch_screen_xy(rawX, rawY, rotation, &sx, &sy);
+    return sx;
 }
 
 #endif

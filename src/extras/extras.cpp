@@ -10,6 +10,9 @@
 #include <board_config.h>
 #include "extras.h"
 #include "fw_update.h"
+#include "../config/wifi_store.h"
+#include "../config/wifi_manager.h"
+#include "../ui/wifi_ui.h"
 #include "../config/nvs_config.h"
 #include "../display/display.h"
 #include "../stats/monitor.h"
@@ -17,7 +20,10 @@
 #include "../mining/miner.h"
 
 #define EXTRAS_NS               "sparkx"
-#define WIFI_RESTART_MS         (5UL * 60 * 1000)   // Reboot after 5 min without WiFi (boot opens setup hotspot)
+#define WIFI_RESCAN_AFTER_MS    20000               // Let the built-in auto-reconnect try first
+#define WIFI_RESCAN_EVERY_MS    60000               // Then look for any saved network every minute
+#define HOT_C                   85.0f               // Chip temperature alert threshold
+#define HOT_FOR_MS              (5UL * 60 * 1000)
 #define OUTAGE_NOTIFY_MS        (10UL * 60 * 1000)  // Outages shorter than this are not reported
 #define ROAM_CHECK_MS           (5UL * 60 * 1000)
 #define ROAM_RSSI_WEAK          -67                 // Only look for a better AP below this signal
@@ -106,6 +112,24 @@ void extras_request_portal() {
     Serial.println("[EXTRAS] Rebooting into WiFi setup hotspot");
     delay(200);
     ESP.restart();
+}
+
+// Hotspot password: random 8 digits per device, created on first use and shown on
+// screen whenever the hotspot is open (the stock "minebitcoin" is public)
+const char* extras_ap_password() {
+    static char pass[9] = "";
+    if (pass[0]) return pass;
+    Preferences p;
+    if (p.begin(EXTRAS_NS, false)) {
+        p.getString("ap_pass", pass, sizeof(pass));
+        if (strlen(pass) != 8) {
+            snprintf(pass, sizeof(pass), "%08lu", (unsigned long)(esp_random() % 100000000UL));
+            p.putString("ap_pass", pass);
+        }
+        p.end();
+    }
+    if (strlen(pass) != 8) strcpy(pass, "12345678");
+    return pass;
 }
 
 bool extras_take_portal_flag() {
@@ -231,7 +255,8 @@ static void roamCheck() {
         int ch = WiFi.channel(best);
         Serial.printf("[WIFI] Roaming: %d dBm -> %d dBm (ch %d)\n", cur, WiFi.RSSI(best), ch);
         WiFi.scanDelete();
-        WiFi.begin(config->ssid, config->wifiPassword, ch, bssid);
+        const wifi_entry_t *e = wifi_store_find(ssid.c_str());
+        WiFi.begin(ssid.c_str(), e ? e->pass : config->wifiPassword, ch, bssid);
         return;
     }
     WiFi.scanDelete();
@@ -246,7 +271,9 @@ void extras_task(void *param) {
     miner_config_t *config = nvs_config_get();
 
     bool bootNotified = false;
-    uint32_t wifiDownSince = 0, poolDownSince = 0;
+    uint32_t wifiDownSince = 0, poolDownSince = 0, lastRescan = 0;
+    uint32_t hotSince = 0;
+    bool hotReported = false;
     bool poolOutageReported = false;
     uint32_t lastAccepted = miner_get_stats()->accepted;
     uint32_t lastBlocks = miner_get_stats()->blocks;
@@ -297,10 +324,12 @@ void extras_task(void *param) {
             // WiFi outage tracking + watchdog
             if (!wifiUp) {
                 if (!wifiDownSince) wifiDownSince = now;
-                if (now - wifiDownSince > WIFI_RESTART_MS) {
-                    Serial.println("[WIFI] No WiFi for 5 minutes - rebooting (setup hotspot opens if still unreachable)");
-                    delay(100);
-                    ESP.restart();
+                // Moved somewhere else or the router changed: join the strongest saved
+                // network in range (not while the user is driving the WiFi menu)
+                if (now - wifiDownSince > WIFI_RESCAN_AFTER_MS && now - lastRescan > WIFI_RESCAN_EVERY_MS &&
+                    !wifi_ui_is_open()) {
+                    lastRescan = now;
+                    wifi_manager_reconnect();
                 }
             } else if (wifiDownSince) {
                 uint32_t outage = now - wifiDownSince;
@@ -329,6 +358,20 @@ void extras_task(void *param) {
                 }
                 poolDownSince = 0;
                 poolOutageReported = false;
+            }
+
+            // Overheat: chip sensor above HOT_C for 5 minutes (sensor is rough, +-10 C)
+            float tempC = temperatureRead();
+            if (tempC > HOT_C) {
+                if (!hotSince) hotSince = now;
+                if (!hotReported && now - hotSince > HOT_FOR_MS) {
+                    char msg[96];
+                    snprintf(msg, sizeof(msg), "Chip at %.0f C for 5 minutes. Move it somewhere with more airflow.", tempC);
+                    hotReported = extras_notify("Miner running hot", msg, "fire", 4);
+                }
+            } else if (tempC < HOT_C - 10) {
+                hotSince = 0;
+                hotReported = false;
             }
 
             // "Connected but dead": pool link up yet nothing hashing for 90 s -> reconnect
@@ -376,7 +419,7 @@ void extras_task(void *param) {
             if (wifiUp) fw_update_poll(s_cfg.autoUpdate);
 
             // Roaming between access points with the same name
-            if (wifiUp && now - lastRoam >= ROAM_CHECK_MS) {
+            if (wifiUp && now - lastRoam >= ROAM_CHECK_MS && !wifi_ui_is_open()) {
                 lastRoam = now;
                 roamCheck();
             }

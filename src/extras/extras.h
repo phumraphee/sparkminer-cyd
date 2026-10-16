@@ -59,6 +59,11 @@ void extras_request_portal();
 bool extras_take_portal_flag();
 
 /**
+ * Setup hotspot password (random per device, shown on screen while the hotspot is open)
+ */
+const char* extras_ap_password();
+
+/**
  * Send a notification now (no-op without a topic). Returns true on HTTP 200.
  */
 bool extras_notify(const char *title, const char *message, const char *tags, int priority);
