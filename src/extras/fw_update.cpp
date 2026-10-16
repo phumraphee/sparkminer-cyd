@@ -116,10 +116,11 @@ static bool downloadAndInstall(const char *tag, const char *file, uint32_t size,
     uint32_t got = 0, lastPct = 0;
     bool writeFailed = false;
 
-    for (int conn = 0; conn < 6 && got < size && !writeFailed; conn++) {
+    int lastCode = 0;
+    for (int conn = 0; conn < 15 && got < size && !writeFailed; conn++) {
         if (conn) {
-            setState("Connection dropped at %lu%% - resuming", (unsigned long)(got * 100 / size));
-            vTaskDelay(pdMS_TO_TICKS(3000));
+            setState("Connection dropped at %lu%% (HTTP %d) - resuming", (unsigned long)(got * 100 / size), lastCode);
+            vTaskDelay(pdMS_TO_TICKS(2000 + conn * 1000));
         }
         WiFiClientSecure client;
         HTTPClient http;
@@ -130,6 +131,7 @@ static bool downloadAndInstall(const char *tag, const char *file, uint32_t size,
         if (!http.begin(client, url)) continue;
         if (got) http.addHeader("Range", String("bytes=") + got + "-");
         int code = http.GET();
+        lastCode = code;
         if (code != (got ? 206 : 200)) { http.end(); continue; }
 
         WiFiClient *stream = http.getStreamPtr();

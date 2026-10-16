@@ -511,6 +511,9 @@ bool wifi_manager_connect(const char *ssid, const char *pass, uint32_t timeoutMs
         Serial.printf("[WIFI] Could not join %s\n", ssid);
         return false;
     }
+    // Modem sleep stalls long transfers (firmware downloads drop mid-way) and adds
+    // pool latency; the miner is mains powered anyway
+    WiFi.setSleep(false);
     Serial.printf("[WIFI] Connected to %s (%d dBm), IP %s\n", ssid, WiFi.RSSI(),
                   WiFi.localIP().toString().c_str());
     // Remember it as the current network (keeps the legacy config fields meaningful)
@@ -588,6 +591,7 @@ bool wifi_manager_reconnect() {
         uint32_t start = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) delay(100);
         if (WiFi.status() == WL_CONNECTED) {
+            WiFi.setSleep(false);
             Serial.printf("[WIFI] Joined %s directly\n", config->ssid);
             return true;
         }
