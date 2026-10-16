@@ -381,6 +381,10 @@ void setup() {
  * Minimal work here - most work done in FreeRTOS tasks
  */
 void loop() {
+    #ifdef ROLLBACK_TEST
+        // Deliberately broken build for testing the OTA rollback: reboot 20 s after start
+        if (millis() > 20000) ESP.restart();
+    #endif
     // Button handling moved to dedicated FreeRTOS task for responsiveness during mining
     // Yield to FreeRTOS tasks
     vTaskDelay(pdMS_TO_TICKS(100));  // Main loop can sleep longer now

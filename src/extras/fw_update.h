@@ -30,6 +30,17 @@ void fw_update_request();
 void fw_update_poll(bool autoUpdate);
 
 /**
+ * Boot: arm rollback bookkeeping, detect a rolled-back update (call once)
+ */
+void fw_update_boot();
+
+/**
+ * Every second: confirm new firmware once the pool is reached, or roll back
+ * after 5 minutes without it
+ */
+void fw_update_health(bool poolUp);
+
+/**
  * Human-readable state for the web UI
  */
 const char* fw_update_state();

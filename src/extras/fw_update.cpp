@@ -9,6 +9,7 @@
 #include <Update.h>
 #include <ArduinoJson.h>
 #include <esp_ota_ops.h>
+#include <Preferences.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/base64.h>
@@ -29,6 +30,16 @@ static const char UPDATE_PUBKEY[] =
     "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE+6XCWDl+54axQKYYOKlNdE6PpSMa\n"
     "+8IAEIAuc/i07ZyhjumELzUCNfXKGZAK/NFqTJQVScdTgsC/F6EzsGQ+IA==\n"
     "-----END PUBLIC KEY-----\n";
+
+#define HEALTHY_WITHIN_MS (5UL * 60 * 1000)   // New firmware must reach the pool within this
+
+// Keep the bootloader's rollback armed after an OTA (Arduino confirms every image at
+// boot by default). fw_update_health() confirms it once the pool is reachable;
+// any reboot before that makes the bootloader return to the previous firmware.
+extern "C" bool verifyRollbackLater() { return true; }
+
+static bool s_pendingVerify = false;
+static uint32_t s_badBuild = 0;           // A build that was rolled back - never reinstall it
 
 static volatile bool s_requested = false;
 static uint32_t s_lastCheck = 0;
@@ -183,6 +194,10 @@ static void checkNow() {
     const char *sig = m["sig"] | "";
     const char *file = m["file"] | "";
 
+    if (build == s_badBuild) {
+        setState("%s was rolled back - waiting for a newer build", tag);
+        return;
+    }
     if (build <= FW_BUILD) {
         setState("Up to date (%s)", tag[0] ? tag : AUTO_VERSION);
         return;
@@ -214,6 +229,10 @@ static void checkNow() {
     }
     if (!installed) return;
 
+    {
+        Preferences p;
+        if (p.begin("sparkupd", false)) { p.putUInt("pending", build); p.end(); }
+    }
     setState("Installed %s - restarting", tag);
     char msg[96];
     snprintf(msg, sizeof(msg), "Installed %s (was %s). Restarting now.", tag, AUTO_VERSION);
@@ -236,6 +255,48 @@ static void updateTask(void *param) {
     vTaskDelete(NULL);
 }
 
+void fw_update_boot() {
+    Preferences p;
+    p.begin("sparkupd", false);
+    s_badBuild = p.getUInt("bad", 0);
+    uint32_t pending = p.getUInt("pending", 0);
+
+    esp_ota_img_states_t st;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    s_pendingVerify = esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY;
+
+    // Came back from a rollback: the build we tried is bad
+    if (!s_pendingVerify && pending && pending != (uint32_t)FW_BUILD && esp_ota_get_last_invalid_partition()) {
+        s_badBuild = pending;
+        p.putUInt("bad", s_badBuild);
+        p.remove("pending");
+        setState("Update failed health check - rolled back");
+        p.end();
+        extras_notify("Update rolled back",
+                      "The new firmware didn't reach the pool, so the miner went back to the previous version.",
+                      "warning", 4);
+        return;
+    }
+    p.end();
+    if (s_pendingVerify) Serial.println("[UPDATE] New firmware on probation until the pool is reached");
+}
+
+void fw_update_health(bool poolUp) {
+    if (!s_pendingVerify) return;
+    if (poolUp) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        s_pendingVerify = false;
+        Preferences p;
+        if (p.begin("sparkupd", false)) { p.remove("pending"); p.end(); }
+        setState("Update confirmed (%s)", AUTO_VERSION);
+        Serial.println("[UPDATE] New firmware confirmed");
+    } else if (millis() > HEALTHY_WITHIN_MS) {
+        Serial.println("[UPDATE] New firmware never reached the pool - rolling back");
+        delay(200);
+        esp_ota_mark_app_invalid_rollback_and_reboot();
+    }
+}
+
 void fw_update_poll(bool autoUpdate) {
     if (s_running) return;
     uint32_t now = millis();
@@ -256,6 +317,8 @@ void fw_update_poll(bool autoUpdate) {
 
 void fw_update_request() {}
 void fw_update_poll(bool) {}
+void fw_update_boot() {}
+void fw_update_health(bool) {}
 const char* fw_update_state() { return "Not configured"; }
 
 #endif
