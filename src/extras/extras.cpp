@@ -338,6 +338,7 @@ static void roamCheck() {
 void extras_task(void *param) {
     Serial.printf("[EXTRAS] Task started on core %d\n", xPortGetCoreID());
     s_lastActivity = millis();
+    fw_update_boot();
     miner_config_t *config = nvs_config_get();
 
     bool bootNotified = false;
@@ -505,6 +506,8 @@ void extras_task(void *param) {
             }
 
             history_tick();
+
+            fw_update_health(poolUp);
 
             // Signed self-update from GitHub Releases (on schedule or when asked)
             if (wifiUp) fw_update_poll(s_cfg.autoUpdate);

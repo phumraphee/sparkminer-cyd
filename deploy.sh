@@ -25,7 +25,7 @@ REPO=$(sed -n 's/.*-D UPDATE_REPO=\\"\([^"\\]*\)\\".*/\1/p' platformio.ini | hea
 # ---------- build ----------
 if [[ "$MODE" != "--no-build" ]]; then
     BUILD=$(date +%s)
-    export PLATFORMIO_BUILD_FLAGS="-DFW_BUILD=$BUILD"
+    export PLATFORMIO_BUILD_FLAGS="-DFW_BUILD=$BUILD ${EXTRA_BUILD_FLAGS:-}"
     "$PIO" run -e "$ENV"
     echo "$BUILD" > ".pio/build/$ENV/build_number"
 fi
