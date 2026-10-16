@@ -192,7 +192,8 @@ static void lightSample() {
         int sum = 0;
         for (int i = 0; i < 8; i++) sum += analogRead(LIGHT_PIN);
         float v = sum / 8.0f;
-        s_light = s_light < 0 ? v : s_light * 0.8f + v * 0.2f;
+        // Heavy smoothing (~20 s): the LDR reading jitters by +-15 % sample to sample
+        s_light = s_light < 0 ? v : s_light * 0.95f + v * 0.05f;
     #endif
 }
 
@@ -487,7 +488,10 @@ void extras_task(void *param) {
             float room = roomLight();
             int level = config->brightness;
             if (s_cfg.autoBright && room >= 0) level = 10 + (int)((config->brightness - 10) * room);
-            bool darkRoom = s_cfg.darkOff && room >= 0 && room < 0.15f;
+            // Hysteresis so a reading near the threshold doesn't flip the screen on and off
+            static bool roomDark = false;
+            if (room >= 0) roomDark = roomDark ? room < 0.25f : room < 0.12f;
+            bool darkRoom = s_cfg.darkOff && room >= 0 && roomDark;
             bool scheduleDim = false;
             if (darkRoom && !woken) { level = 0; scheduleDim = true; }
             if (night && !woken && level > s_cfg.nightBright) { level = s_cfg.nightBright; scheduleDim = true; }
@@ -495,7 +499,7 @@ void extras_task(void *param) {
             if (blockParty) { level = config->brightness; scheduleDim = false; }
             s_dimmed = scheduleDim;   // A tap on a dimmed screen only wakes it
             static int applied = -1;
-            if (applied < 0 || abs(level - applied) >= 3 || (level == 0) != (applied == 0)) {
+            if (applied < 0 || abs(level - applied) >= 6 || (level == 0) != (applied == 0)) {
                 applied = level;
                 display_set_brightness(level);
             }
