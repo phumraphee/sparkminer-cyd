@@ -27,6 +27,7 @@
 #include "web/web_ui.h"
 #include "extras/extras.h"
 #include "display/touch_cyd.h"
+#include "ui/wifi_ui.h"
 
 // Task handles
 TaskHandle_t miner0Task = NULL;
@@ -51,6 +52,7 @@ OneButton button(BUTTON_PIN, true, true);  // active low, enable pullup
 
 // Single click: cycle screens
 void onButtonClick() {
+    if (wifi_ui_is_open()) { wifi_ui_close(); return; }
     extras_ack_block();
     if (extras_is_dimmed()) { extras_wake(); return; }
     display_next_screen();
@@ -134,6 +136,7 @@ void button_task(void *param) {
         pinMode(TOUCH_IRQ_PIN, INPUT);
         uint32_t touchStart = 0;
         uint32_t lastTap = 0;
+        bool holdFired = false;
         #ifdef HAVE_TOUCH_POSITION
             touch_init();
             uint16_t tapX = 0, tapY = 0;
@@ -144,16 +147,19 @@ void button_task(void *param) {
         button.tick();
         #ifdef TOUCH_IRQ_PIN
             // Tap right half: next screen, left half: previous (wakes the screen first at night)
-            // Hold 3 s: reboot into the WiFi setup hotspot (other settings are kept)
+            // Hold 3 s: WiFi menu. While the menu is open, taps go to it.
             bool pressed = digitalRead(TOUCH_IRQ_PIN) == LOW;
             uint32_t now = millis();
             if (pressed && !touchStart) {
                 touchStart = now;
+                holdFired = false;
                 #ifdef HAVE_TOUCH_POSITION
                     tapPos = false;
                 #endif
             } else if (pressed && now - touchStart >= 3000) {
-                extras_request_portal();
+                // Hold 3 s: WiFi menu (once per press)
+                if (!holdFired && !wifi_ui_is_open()) wifi_ui_open();
+                holdFired = true;
             } else if (pressed) {
                 #ifdef HAVE_TOUCH_POSITION
                     // Sample once the contact has settled
@@ -162,7 +168,16 @@ void button_task(void *param) {
             } else if (!pressed && touchStart) {
                 uint32_t held = now - touchStart;
                 touchStart = 0;
-                if (held >= 30 && held < 1500 && now - lastTap > 300) {
+                if (held >= 30 && held < 1500 && now - lastTap > 150 && wifi_ui_is_open()) {
+                    lastTap = now;
+                    #ifdef HAVE_TOUCH_POSITION
+                        if (tapPos) {
+                            float fx, fy;
+                            touch_screen_xy(tapX, tapY, nvs_config_get()->rotation, &fx, &fy);
+                            wifi_ui_touch(fx, fy);
+                        }
+                    #endif
+                } else if (held >= 30 && held < 1500 && now - lastTap > 300) {
                     lastTap = now;
                     #ifdef HAVE_TOUCH_POSITION
                         if (tapPos) touch_record_tap(tapX, tapY);
@@ -438,8 +453,8 @@ void setupTasks() {
         0
     );
 
-    // Web UI (status + settings on the LAN) - only once WiFi is up
-    if (WiFi.status() == WL_CONNECTED) {
+    // Web UI (status + settings on the LAN) - starts serving once WiFi is up
+    {
         xTaskCreatePinnedToCore(
             web_ui_task,
             "WebUI",

@@ -25,6 +25,11 @@ bool touch_read_raw(uint16_t *x, uint16_t *y);
 float touch_screen_x(uint16_t rawX, uint16_t rawY, uint8_t rotation);
 
 /**
+ * Tap position as fractions of screen width/height (0,0 = top-left) for the rotation
+ */
+void touch_screen_xy(uint16_t rawX, uint16_t rawY, uint8_t rotation, float *sx, float *sy);
+
+/**
  * Remember a tap position / read the last 4 (oldest first) for calibration
  */
 void touch_record_tap(uint16_t x, uint16_t y);

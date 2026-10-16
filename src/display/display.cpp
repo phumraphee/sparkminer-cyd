@@ -102,6 +102,8 @@ static uint8_t s_brightness = 100;
 static uint8_t s_rotation = 1;  // Current rotation (0-3)
 static bool s_needsRedraw = true;
 static display_data_t s_lastData;
+static SemaphoreHandle_t s_tftMutex = NULL;   // One drawer at a time (monitor vs WiFi menu)
+static volatile bool s_taken = false;         // WiFi menu owns the screen
 
 // ============================================================
 // Helper Functions
@@ -912,6 +914,7 @@ static void drawQrScreen(const display_data_t *data) {
 // ============================================================
 
 void display_init(uint8_t rotation, uint8_t brightness) {
+    if (!s_tftMutex) s_tftMutex = xSemaphoreCreateMutex();
     Serial.printf("[DISPLAY] Init with rotation=%d, brightness=%d\n", rotation, brightness);
 
     // Enable 5V power for T-Display S3 (required before display init)
@@ -1017,8 +1020,39 @@ void display_init(uint8_t rotation, uint8_t brightness) {
     Serial.println("[DISPLAY] Initialized");
 }
 
+TFT_eSPI* display_tft() {
+    return &s_tft;
+}
+
+void display_lock() {
+    if (!s_tftMutex) s_tftMutex = xSemaphoreCreateMutex();
+    xSemaphoreTake(s_tftMutex, portMAX_DELAY);
+}
+
+void display_unlock() {
+    xSemaphoreGive(s_tftMutex);
+}
+
+void display_take(bool take) {
+    display_lock();
+    s_taken = take;
+    if (!take) {
+        s_tft.fillScreen(COLOR_BG);
+        s_needsRedraw = true;
+    }
+    display_unlock();
+}
+
+static void displayUpdateLocked(const display_data_t *data);
+
 void display_update(const display_data_t *data) {
-    if (!data) return;
+    if (!data || s_taken) return;
+    display_lock();
+    if (!s_taken) displayUpdateLocked(data);
+    display_unlock();
+}
+
+static void displayUpdateLocked(const display_data_t *data) {
 
     // Check if anything changed
     bool dataChanged = (data->totalHashes != s_lastData.totalHashes) ||

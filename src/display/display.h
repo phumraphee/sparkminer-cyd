@@ -102,6 +102,13 @@ uint8_t display_get_screen();
 void display_next_screen();
 void display_prev_screen();
 
+// Exclusive screen access for full-screen UIs (WiFi menu)
+class TFT_eSPI;
+TFT_eSPI* display_tft();
+void display_lock();
+void display_unlock();
+void display_take(bool take);   // true: normal screens stop drawing; false: hand back + redraw
+
 /**
  * Force full redraw
  */

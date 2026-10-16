@@ -21,6 +21,7 @@
 #include "../mining/miner.h"
 #include "../display/touch_cyd.h"
 #include "../extras/fw_update.h"
+#include "../config/wifi_store.h"
 
 static WebServer s_server(80);
 static bool s_started = false;
@@ -73,6 +74,8 @@ button.sec{background:#2c2c2c;color:var(--fg)}small{color:var(--mut)}.msg{color:
 <div class="tile wide"><span>Pool</span><b id="pool" style="font-size:15px">-</b></div>
 <div class="tile"><span>WiFi signal</span><b id="rssi">-</b></div>
 <div class="tile"><span>Free memory</span><b id="heap">-</b></div>
+<div class="tile"><span>Chip temperature</span><b id="tmp">-</b></div>
+<div class="tile"><span>WiFi network</span><b id="wn" style="font-size:15px">-</b></div>
 <div class="tile"><span>BTC price</span><b id="px">-</b></div>
 <div class="tile"><span>Block height</span><b id="bh">-</b></div>
 <div class="tile wide"><span>Network hashrate / difficulty</span><b id="net" style="font-size:15px">-</b></div>
@@ -82,9 +85,7 @@ button.sec{background:#2c2c2c;color:var(--fg)}small{color:var(--mut)}.msg{color:
 <div id="pinbar" class="card"><label>Admin PIN <small>(needed to change anything)</small></label><input id="pin" type="password" inputmode="numeric" autocomplete="current-password"></div>
 
 <form id="f">
-<h2>WiFi &amp; wallet</h2><div class="card">
-<label>WiFi name (SSID)</label><input name="ssid" maxlength="63">
-<label>WiFi password <small>(blank = keep current)</small></label><input name="wifipass" type="password" maxlength="64">
+<h2>Wallet &amp; pool</h2><div class="card">
 <label>BTC wallet address <small>(receive address only &mdash; never a seed phrase)</small></label><input name="wallet" maxlength="120" autocomplete="off" spellcheck="false">
 <label>Worker name</label><input name="worker" maxlength="31">
 <div class="row"><div><label>Pool URL</label><input name="pool_url" maxlength="80"></div><div><label>Port</label><input name="pool_port" type="number" min="1" max="65535"></div></div>
@@ -119,6 +120,18 @@ button.sec{background:#2c2c2c;color:var(--fg)}small{color:var(--mut)}.msg{color:
 <div class="msg" id="msg"></div>
 </form>
 
+<h2>WiFi networks</h2><div class="card">
+<p style="margin:10px 0 4px"><small>Joins the strongest saved network in range. On the miner: hold the screen 3 s for the WiFi menu.</small></p>
+<div id="wl"></div>
+<label>Add network</label>
+<div class="row"><div><input id="ns" list="nl" placeholder="WiFi name" maxlength="32" autocomplete="off"><datalist id="nl"></datalist></div>
+<div><button type="button" class="sec" id="sc" style="margin-top:0">Scan</button></div></div>
+<input id="np" type="password" placeholder="Password (blank for open WiFi)" maxlength="64" style="margin-top:8px" autocomplete="new-password">
+<button type="button" class="sec" id="na">Save network</button>
+<div class="msg" id="msg3"></div>
+<p style="margin:10px 0 0"><small>Setup hotspot password: <b id="app">(enter PIN)</b></small></p>
+</div>
+
 <h2>Maintenance</h2><div class="card">
 <label class="ck"><input type="checkbox" form="f" name="auto_up" value="1" id="au">Install updates automatically (checked every 6 h)</label>
 <small id="ust">Update status: -</small>
@@ -144,7 +157,7 @@ function load(){fetch('/api/status').then(function(r){return r.json()}).then(fun
 $('hr').textContent=hr(s.hashrate);$('best').textContent=num(s.best);$('sh').textContent=s.accepted+' / '+s.rejected;
 $('blk').textContent=s.blocks;$('up').textContent=up(s.uptime);$('ping').textContent=s.ping+' ms';
 $('pool').innerHTML='<span class="dot'+(s.pool_ok?' on':'')+'"></span>'+(s.pool||'-');
-$('rssi').textContent=s.rssi+' dBm';$('heap').textContent=Math.round(s.heap/1024)+' KB';
+$('rssi').textContent=s.rssi+' dBm';$('tmp').textContent=Math.round(s.temp)+' \u00b0C';$('wn').textContent=s.ssid||'-';$('heap').textContent=Math.round(s.heap/1024)+' KB';
 $('px').textContent=s.btc?'$'+Math.round(s.btc).toLocaleString():'-';$('bh').textContent=s.height||'-';
 $('ust').textContent='Update status: '+s.update;$('net').textContent=(s.net_hr||'-')+' / '+(s.net_diff||'-');$('host').textContent=s.host+' · '+s.ip+' · '+s.version;
 }).catch(function(){})}
@@ -159,6 +172,18 @@ $('f').onsubmit=function(e){e.preventDefault();if(!confirm('Save settings and re
 var fd=new FormData($('f'));['night','led','https','daily','auto_up'].forEach(function(n){if(!fd.has(n))fd.append(n,'0')});
 post('/api/save',new URLSearchParams(fd),'msg')};
 $('tn').onclick=function(){var b=new URLSearchParams();b.append('ntfy',$('f').ntfy.value);post('/api/test-notify',b,'msg')};
+function esc(t){var d=document.createElement('div');d.textContent=t;return d.innerHTML}
+function wifi(){fetch('/api/wifi',{headers:{'X-PIN':$('pin').value}}).then(function(r){return r.json()}).then(function(w){
+var h='';w.saved.forEach(function(n){h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line)"><span>'+(n==w.current?'<span class="dot on"></span>':'')+esc(n)+'</span><button type="button" class="sec" data-ssid="'+esc(n)+'" style="width:auto;margin:0;padding:6px 12px">Forget</button></div>'});
+$('wl').innerHTML=h||'<small>No saved networks</small>';if(w.ap_pass)$('app').textContent=w.ap_pass;
+Array.prototype.forEach.call($('wl').querySelectorAll('button'),function(b){b.onclick=function(){if(!confirm('Forget '+b.dataset.ssid+'?'))return;
+var p=new URLSearchParams();p.append('ssid',b.dataset.ssid);post('/api/wifi/remove',p,'msg3').then(wifi)}})})}
+wifi();$('pin').addEventListener('change',wifi);
+$('sc').onclick=function(){say('msg3','Scanning...');fetch('/api/wifi/scan').then(function(r){return r.json()}).then(function(l){
+$('nl').innerHTML=l.map(function(n){return '<option value="'+esc(n.ssid)+'">'+n.rssi+' dBm'+(n.saved?' (saved)':'')+'</option>'}).join('');
+say('msg3',l.length+' networks found - pick one in the name box')})};
+$('na').onclick=function(){var p=new URLSearchParams();p.append('ssid',$('ns').value);p.append('pass',$('np').value);
+post('/api/wifi/add',p,'msg3').then(function(ok){if(ok){$('np').value='';wifi()}})};
 $('cu').onclick=function(){post('/api/check-update','','msg2')};
 $('rb').onclick=function(){if(confirm('Restart the miner?'))post('/api/restart','','msg2')};
 $('wp').onclick=function(){if(confirm('Reboot into the WiFi setup hotspot? Mining pauses until it is set up or 5 minutes pass.'))post('/api/portal','','msg2')};
@@ -243,6 +268,8 @@ static void handleStatus() {
     j += ",\"pool_ok\":";   j += d->poolConnected ? "true" : "false";
     j += ",\"pool\":";      jsonStr(j, d->poolName);
     j += ",\"rssi\":";      j += (int)WiFi.RSSI();
+    j += ",\"ssid\":";      jsonStr(j, WiFi.SSID().c_str());
+    j += ",\"temp\":";      snprintf(buf, sizeof(buf), "%.1f", temperatureRead()); j += buf;
     j += ",\"heap\":";      j += ESP.getFreeHeap();
     j += ",\"btc\":";       snprintf(buf, sizeof(buf), "%.0f", d->btcPrice); j += buf;
     j += ",\"height\":";    j += d->blockHeight;
@@ -392,6 +419,64 @@ static void handleTestNotify() {
         ok ? "Sent - check the ntfy app. Remember to Save." : "Could not reach ntfy.sh.");
 }
 
+// Saved networks (passwords never leave the miner)
+static void handleWifiList() {
+    String j = "{\"current\":";
+    jsonStr(j, WiFi.status() == WL_CONNECTED ? WiFi.SSID().c_str() : "");
+    j += ",\"saved\":[";
+    for (int i = 0; i < wifi_store_count(); i++) {
+        if (i) j += ",";
+        jsonStr(j, wifi_store_get(i)->ssid);
+    }
+    j += "]";
+    if (pinOk()) { j += ",\"ap_pass\":"; jsonStr(j, extras_ap_password()); }
+    j += "}";
+    s_server.send(200, "application/json", j);
+}
+
+static void handleWifiScan() {
+    int n = WiFi.scanNetworks(false, false);
+    String j = "[";
+    int out = 0;
+    for (int i = 0; i < n; i++) {
+        String ssid = WiFi.SSID(i);
+        if (!ssid.length()) continue;
+        bool dup = false;
+        for (int k = 0; k < i; k++) if (WiFi.SSID(k) == ssid) dup = true;   // Sorted strongest first
+        if (dup) continue;
+        if (out++) j += ",";
+        j += "{\"ssid\":"; jsonStr(j, ssid.c_str());
+        j += ",\"rssi\":"; j += WiFi.RSSI(i);
+        j += ",\"saved\":"; j += wifi_store_find(ssid.c_str()) ? "true" : "false";
+        j += "}";
+    }
+    j += "]";
+    WiFi.scanDelete();
+    s_server.send(200, "application/json", j);
+}
+
+static void handleWifiAdd() {
+    if (!requirePin()) return;
+    String ssid = s_server.arg("ssid"), pass = s_server.arg("pass");
+    if (!ssid.length() || ssid.length() > 32) { s_server.send(400, "text/plain", "WiFi name must be 1-32 characters."); return; }
+    if (pass.length() && (pass.length() < 8 || pass.length() > 64)) {
+        s_server.send(400, "text/plain", "WiFi passwords are 8-64 characters (blank for open networks).");
+        return;
+    }
+    if (!wifi_store_put(ssid.c_str(), pass.c_str())) { s_server.send(500, "text/plain", "Could not save."); return; }
+    s_server.send(200, "text/plain", "Saved. The miner will use it whenever it is the strongest saved network in range.");
+}
+
+static void handleWifiRemove() {
+    if (!requirePin()) return;
+    String ssid = s_server.arg("ssid");
+    if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid && wifi_store_count() == 1) {
+        s_server.send(400, "text/plain", "That is the only saved network - add another one first.");
+        return;
+    }
+    s_server.send(wifi_store_remove(ssid.c_str()) ? 200 : 404, "text/plain", "Removed.");
+}
+
 static void handleCheckUpdate() {
     if (!requirePin()) return;
     fw_update_request();
@@ -505,6 +590,10 @@ void web_ui_start() {
     s_server.on("/api/test-notify", HTTP_POST, handleTestNotify);
     s_server.on("/api/restart", HTTP_POST, handleRestart);
     s_server.on("/api/check-update", HTTP_POST, handleCheckUpdate);
+    s_server.on("/api/wifi", HTTP_GET, handleWifiList);
+    s_server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
+    s_server.on("/api/wifi/add", HTTP_POST, handleWifiAdd);
+    s_server.on("/api/wifi/remove", HTTP_POST, handleWifiRemove);
     s_server.on("/api/portal", HTTP_POST, handlePortal);
     s_server.on("/api/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
     s_server.onNotFound([]() { s_server.send(404, "text/plain", "Not found"); });
@@ -516,8 +605,8 @@ void web_ui_start() {
 }
 
 void web_ui_task(void *param) {
-    web_ui_start();
     for (;;) {
+        if (!s_started) web_ui_start();   // No-op until WiFi is connected
         if (s_started) s_server.handleClient();
         if (s_restartAt && (int32_t)(millis() - s_restartAt) >= 0) {
             if (s_portalAfter) extras_request_portal();  // reboots
