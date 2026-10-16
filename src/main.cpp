@@ -28,6 +28,7 @@
 #include "extras/extras.h"
 #include "display/touch_cyd.h"
 #include "ui/wifi_ui.h"
+#include "ui/touch_cal.h"
 
 // Task handles
 TaskHandle_t miner0Task = NULL;
@@ -142,6 +143,7 @@ void button_task(void *param) {
             touch_init();
             uint16_t tapX = 0, tapY = 0;
             bool tapPos = false;
+            uint32_t sumX = 0, sumY = 0, nSamples = 0;
         #endif
     #endif
     for (;;) {
@@ -149,13 +151,14 @@ void button_task(void *param) {
         #ifdef TOUCH_IRQ_PIN
             // Tap right half: next screen, left half: previous (wakes the screen first at night)
             // Hold 3 s: WiFi menu. While the menu is open, taps go to it.
-            bool pressed = digitalRead(TOUCH_IRQ_PIN) == LOW;
+            bool pressed = digitalRead(TOUCH_IRQ_PIN) == LOW && !touch_cal_active();
             uint32_t now = millis();
             if (pressed && !touchStart) {
                 touchStart = now;
                 holdFired = false;
                 #ifdef HAVE_TOUCH_POSITION
                     tapPos = false;
+                    sumX = sumY = nSamples = 0;
                 #endif
             } else if (pressed && now - touchStart >= 3000) {
                 // Hold 3 s: WiFi menu (once per press)
@@ -163,8 +166,13 @@ void button_task(void *param) {
                 holdFired = true;
             } else if (pressed) {
                 #ifdef HAVE_TOUCH_POSITION
-                    // Sample once the contact has settled
-                    if (!tapPos && now - touchStart >= 40) tapPos = touch_read_raw(&tapX, &tapY);
+                    // Average every pressure-checked sample once the contact has settled
+                    uint16_t rx, ry;
+                    if (now - touchStart >= 30 && touch_read_raw(&rx, &ry)) {
+                        sumX += rx; sumY += ry; nSamples++;
+                        tapX = sumX / nSamples; tapY = sumY / nSamples;
+                        tapPos = true;
+                    }
                 #endif
             } else if (!pressed && touchStart) {
                 uint32_t held = now - touchStart;

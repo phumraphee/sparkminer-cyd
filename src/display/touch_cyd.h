@@ -30,6 +30,15 @@ float touch_screen_x(uint16_t rawX, uint16_t rawY, uint8_t rotation);
 void touch_screen_xy(uint16_t rawX, uint16_t rawY, uint8_t rotation, float *sx, float *sy);
 
 /**
+ * Calibration: screen fraction -> panel-portrait fraction, least-squares fit of
+ * raw points (returns the worst residual as a screen fraction), apply/save, reload
+ */
+void touch_screen_to_panel(float sx, float sy, uint8_t rotation, float *px, float *py);
+float touch_fit_calibration(const uint16_t raw[][2], const float panel[][2], int n, float outCal[6]);
+void touch_set_calibration(const float cal[6], bool save);
+void touch_reload_calibration();
+
+/**
  * Remember a tap position / read the last 4 (oldest first) for calibration
  */
 void touch_record_tap(uint16_t x, uint16_t y);
