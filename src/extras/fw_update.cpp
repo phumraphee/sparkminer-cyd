@@ -9,6 +9,7 @@
 #include <Update.h>
 #include <ArduinoJson.h>
 #include <esp_ota_ops.h>
+#include <esp_task_wdt.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/base64.h>
@@ -167,6 +168,7 @@ static void checkNow() {
         mbedtls_sha256_update_ret(&ctx, buf, r);
         if (Update.write(buf, r) != (size_t)r) break;
         got += r;
+        vTaskDelay(1);  // Let the rest of core 0 breathe between chunks
         uint32_t pct = got * 100 / size;
         if (pct >= lastPct + 10) { lastPct = pct; setState("Downloading %s: %lu%%", tag, (unsigned long)pct); }
     }
@@ -201,7 +203,13 @@ static volatile bool s_running = false;
 
 // TLS + JSON + ECDSA verification need far more stack than the extras task has
 static void updateTask(void *param) {
+    // The core-0 miner and this task share priority 1 and never block together
+    // during a download, so IDLE0 can't feed the task watchdog for 30 s+.
+    // Unwatch it for the duration of the check.
+    TaskHandle_t idle0 = xTaskGetIdleTaskHandleForCPU(0);
+    bool unwatched = esp_task_wdt_delete(idle0) == ESP_OK;
     checkNow();             // Reboots on success
+    if (unwatched) esp_task_wdt_add(idle0);
     s_running = false;
     vTaskDelete(NULL);
 }
