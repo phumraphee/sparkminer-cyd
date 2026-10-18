@@ -46,6 +46,11 @@ void miner_stop();
 bool miner_is_running();
 
 /**
+ * Network difficulty derived from the current job's nbits (0 before the first job)
+ */
+double miner_network_difficulty();
+
+/**
  * Park the core-1 hardware-SHA miner while the caller uses the SHA peripheral
  * (TLS, OTA image check). Calls nest; every hold needs a matching release.
  */

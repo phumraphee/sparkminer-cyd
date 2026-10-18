@@ -885,7 +885,7 @@ void live_stats_task(void *param) {
 
             // HTTPS APIs (only if proxy or direct HTTPS enabled)
             if (s_proxyConfigured || s_httpsEnabled) {
-                if (now - s_lastPriceUpdate > UPDATE_PRICE_MS) {
+                if (now - s_lastPriceUpdate > (s_stats.priceValid ? UPDATE_PRICE_MS : 120000UL)) {
                     updatePrice();
                     s_lastPriceUpdate = millis();
                     vTaskDelay(500 / portTICK_PERIOD_MS);
@@ -897,7 +897,7 @@ void live_stats_task(void *param) {
                     vTaskDelay(500 / portTICK_PERIOD_MS);
                 }
 
-                if (now - s_lastNetworkUpdate > UPDATE_NETWORK_MS) {
+                if (now - s_lastNetworkUpdate > (s_stats.networkValid ? UPDATE_NETWORK_MS : 120000UL)) {
                     updateNetworkHashrate();
                     vTaskDelay(500 / portTICK_PERIOD_MS);
                     updateNetworkDifficulty();

@@ -404,6 +404,16 @@ void miner_stop() {
     s_miningActive = false;
 }
 
+// Network difficulty from the current job's compact target (nbits):
+// diff = diff1_target / target, diff1 = 0xffff * 2^(8*(0x1d-3))
+double miner_network_difficulty() {
+    uint32_t nbits = s_pendingBlock.difficulty;
+    uint32_t mant = nbits & 0x00ffffff;
+    int exp = nbits >> 24;
+    if (!mant || exp < 3) return 0;
+    return (65535.0 / mant) * pow(2.0, 8.0 * (0x1d - exp));
+}
+
 bool miner_is_running() {
     return s_miningActive;
 }

@@ -110,6 +110,14 @@ static void updateDisplayData(display_data_t *data) {
     data->wifiRssi = data->wifiConnected ? WiFi.RSSI() : 0;
     data->ipAddress = wifi_manager_get_ip();
 
+    // Network difficulty straight from the pool's job (no internet API needed);
+    // the stats API value below only fills the formatted text if available
+    double jobDiff = miner_network_difficulty();
+    if (jobDiff > 0) {
+        data->networkDifficultyRaw = jobDiff;
+        snprintf(data->networkDifficulty, sizeof(data->networkDifficulty), "%.2f T", jobDiff / 1e12);
+    }
+
     // Live stats
     const live_stats_t *lstats = live_stats_get();
 
@@ -123,9 +131,11 @@ static void updateDisplayData(display_data_t *data) {
         // Use strncpy for fixed char arrays (no heap allocation)
         strncpy(data->networkHashrate, lstats->networkHashrate, sizeof(data->networkHashrate) - 1);
         data->networkHashrate[sizeof(data->networkHashrate) - 1] = '\0';
-        data->networkDifficultyRaw = lstats->difficultyRaw;
-        strncpy(data->networkDifficulty, lstats->networkDifficulty, sizeof(data->networkDifficulty) - 1);
-        data->networkDifficulty[sizeof(data->networkDifficulty) - 1] = '\0';
+        if (jobDiff <= 0) {
+            data->networkDifficultyRaw = lstats->difficultyRaw;
+            strncpy(data->networkDifficulty, lstats->networkDifficulty, sizeof(data->networkDifficulty) - 1);
+            data->networkDifficulty[sizeof(data->networkDifficulty) - 1] = '\0';
+        }
     }
     if (lstats->feesValid) {
         data->halfHourFee = lstats->halfHourFee;
