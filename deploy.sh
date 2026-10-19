@@ -58,7 +58,7 @@ if [[ "$MODE" == "" && -n "$REPO" ]]; then
         cd "$OTA"
         git init -q -b ota
         git add .
-        git -c user.email=phumraphee@gmail.com -c user.name=phumraphee commit -q -m "OTA $TAG"
+        git -c user.email=github@phumraphee.me -c user.name="Phumraphee Sae-tang" commit -q -m "OTA $TAG"
         git push -q -f "https://github.com/$REPO.git" ota:ota
     )
     rm -rf "$OTA"
